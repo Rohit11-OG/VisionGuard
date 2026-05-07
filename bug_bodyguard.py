@@ -9,6 +9,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import difflib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import importlib.util
 import json
@@ -598,7 +599,9 @@ class RuffDiffProposer:
 
 
 class BugDetector:
-    LINT_RE = re.compile(r"^(?P<file>[^:\s][^:]*):(?P<line>\d+):(?P<col>\d+)?:?\s*(?P<msg>.+)$", re.M)
+    # [^:\n] prevents the file group from consuming newlines, which caused multi-line
+    # mismatches where the error message text ended up in the file_path field.
+    LINT_RE = re.compile(r"^(?P<file>[^:\s\n][^:\n]*\.pyi?):(?P<line>\d+):(?P<col>\d+)?:?\s*(?P<msg>.+)$", re.M)
     SYNTAX_RE = re.compile(
         r'File "(?P<file>.+?)", line (?P<line>\d+)\n(?P<code>.*)\n\s*\^\nSyntaxError:\s*(?P<msg>.+)',
         re.S,
@@ -697,6 +700,8 @@ class BugDetector:
             if result.returncode == 0:
                 continue
             output = result.combined_output
+            if not output.strip():
+                continue
             issues.extend(self._parse_syntax_errors(result.name, output))
             issues.extend(self._parse_name_errors(result.name, output))
             issues.extend(self._parse_attribute_errors(result.name, output))
@@ -1394,8 +1399,6 @@ def root_cause_hypothesis(issue: Issue) -> str:
 class CVASTVisitor(ast.NodeVisitor):
     """Walk one Python file and emit CV-specific issues found via AST analysis."""
 
-    _MODEL_NAME_RE = re.compile(r"model|net|network|classifier|detector|backbone|encoder|decoder", re.I)
-
     def __init__(self, file_path: pathlib.Path, root: pathlib.Path) -> None:
         self.file_path = file_path
         self.root = root
@@ -1413,9 +1416,7 @@ class CVASTVisitor(ast.NodeVisitor):
         self._videocap_vars: dict[str, int] = {}     # cap = cv2.VideoCapture(...)
         self._cap_opened_checked: set[str] = set()   # cap.isOpened() seen
         self._cap_reported: set[str] = set()         # suppress dup reports
-        # torch.load tracking
         self._no_grad_ctx_depth: int = 0             # nesting depth of torch.no_grad() contexts
-        self._eval_called_vars: set[str] = set()     # model vars that had .eval() called
 
     def _rel(self) -> str:
         try:
@@ -1590,31 +1591,6 @@ class CVASTVisitor(ast.NodeVisitor):
                     confidence=0.85,
                 )
 
-    def _check_model_no_eval(self, node: ast.Call) -> None:
-        """Flag model(x) called in a function where model.eval() was never seen."""
-        # We detect model(x) calls where the callable looks like a model variable
-        func = node.func
-        if not isinstance(func, ast.Name):
-            return
-        if not self._MODEL_NAME_RE.search(func.id):
-            return
-        # Check if .eval() was called anywhere in the same visitor context
-        # We use a simple heuristic: flag if model name never had .eval() in file
-        # This is caught at module-level; in a class context it may have false positives
-        issue_id = f"cvstatic-model-noeval-{short_hash(self._rel() + func.id + str(node.lineno))}"
-        self._issue(
-            issue_id=issue_id,
-            title=f"Model '{func.id}' called — verify eval() and no_grad() used for inference",
-            desc=(
-                f"Line {node.lineno}: '{func.id}(...)' detected. "
-                "During inference call model.eval() and wrap in torch.no_grad() "
-                "to disable dropout/batchnorm training mode and avoid gradient memory waste."
-            ),
-            line=node.lineno,
-            severity="low",
-            confidence=0.60,
-        )
-
     # ── RealSense checks ──────────────────────────────────────────────────────
 
     _RS_FRAME_METHODS = {"get_color_frame", "get_depth_frame", "get_infrared_frame",
@@ -1658,13 +1634,6 @@ class CVASTVisitor(ast.NodeVisitor):
                 name = self._name(target)
                 if name:
                     self._videocap_vars[name] = node.lineno
-        # Track .eval() calls: model.eval()
-        if (isinstance(val, ast.Call)
-                and isinstance(val.func, ast.Attribute)
-                and val.func.attr == "eval"):
-            obj_name = self._name(val.func.value)
-            if obj_name:
-                self._eval_called_vars.add(obj_name)
         self.generic_visit(node)
 
     def _check_wait_for_frames_timeout(self, node: ast.Call) -> None:
@@ -1752,8 +1721,6 @@ class CVASTVisitor(ast.NodeVisitor):
             self._rs_valid_checked.add(node.value.id)
         if node.attr == "isOpened" and isinstance(node.value, ast.Name):
             self._cap_opened_checked.add(node.value.id)
-        if node.attr == "eval" and isinstance(node.value, ast.Name):
-            self._eval_called_vars.add(node.value.id)
         self.generic_visit(node)
 
     # ── Depth divide-by-zero ─────────────────────────────────────────────────
@@ -1980,7 +1947,6 @@ class CVASTVisitor(ast.NodeVisitor):
         self._check_numpy_no_detach(node)
         self._check_plt_imshow_bgr(node)
         self._check_cv2_resize_dsize(node)
-        self._check_model_no_eval(node)
         self._check_wait_for_frames_timeout(node)
         self._check_rs_frame_used_unchecked(node)
         self._check_yolo_masks_none(node)
@@ -2027,9 +1993,11 @@ class _ThreadSafetyChecker:
         return False
 
     def _check_method(self, func: ast.FunctionDef) -> None:
-        lock_lines: set[int] = set()  # lines covered by with self._lock:
-        unsafe: list[tuple[str, int]] = []
+        lock_lines: set[int] = set()
+        attr_accesses: list[tuple[str, int]] = []
 
+        # Single pass: ast.walk is BFS so With nodes appear before their children,
+        # meaning lock_lines is populated before inner attribute nodes are visited.
         for node in ast.walk(func):
             if isinstance(node, ast.With):
                 for item in node.items:
@@ -2038,22 +2006,18 @@ class _ThreadSafetyChecker:
                             and isinstance(ctx.value, ast.Name)
                             and ctx.value.id == "self"
                             and self._LOCK_RE.search(ctx.attr)):
-                        # Mark all lines within this with block as lock-protected
                         for child in ast.walk(node):
                             if hasattr(child, "lineno"):
                                 lock_lines.add(child.lineno)
-
-        for node in ast.walk(func):
-            if isinstance(node, ast.Attribute):
+            elif isinstance(node, ast.Attribute):
                 if (isinstance(node.value, ast.Name)
                         and node.value.id == "self"
-                        and self._SHARED_RE.match(node.attr)
-                        and node.lineno not in lock_lines):
-                    unsafe.append((node.attr, node.lineno))
+                        and self._SHARED_RE.match(node.attr)):
+                    attr_accesses.append((node.attr, node.lineno))
 
         seen: set[str] = set()
-        for attr, lineno in unsafe:
-            if attr in seen:
+        for attr, lineno in attr_accesses:
+            if lineno in lock_lines or attr in seen:
                 continue
             seen.add(attr)
             issue_id = f"cvstatic-thread-nolock-{short_hash(self.rel_path + func.name + attr)}"
@@ -2075,29 +2039,121 @@ class _ThreadSafetyChecker:
 class CVStaticAnalyzer:
     """Run AST-based CV anti-pattern analysis across all Python files in the repo."""
 
+    # Fast string hints: if none present the file has no CV patterns to detect.
+    _CV_HINTS: frozenset[str] = frozenset({
+        "import cv2", "import torch", "import numpy", "import pyrealsense2",
+        "from ultralytics", "from PIL", "import PIL", "import threading",
+        "import queue", "from torch", "from torchvision", "from queue",
+        "cv2.", "torch.", "np.", "pyrealsense2", "ultralytics",
+    })
+
     def __init__(self, root: pathlib.Path, cfg: dict[str, Any]) -> None:
         self.root = root
         self.cfg = cfg
+        self._cache_path = root / ".agent" / "index" / "cv_cache.json"
+
+    def _has_cv_hints(self, source: str) -> bool:
+        return any(h in source for h in self._CV_HINTS)
+
+    def _load_cache(self) -> dict[str, Any]:
+        try:
+            if self._cache_path.exists():
+                return json.loads(self._cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_cache(self, cache: dict[str, Any]) -> None:
+        try:
+            ensure_dir(self._cache_path.parent)
+            self._cache_path.write_text(json.dumps(cache, separators=(",", ":")), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _analyze_file(self, file_path: pathlib.Path) -> list[Issue]:
+        """Parse and walk one file; return its issues. Safe to call from threads."""
+        try:
+            source = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return []
+        if not self._has_cv_hints(source):
+            return []
+        try:
+            tree = ast.parse(source, filename=str(file_path))
+        except SyntaxError:
+            return []
+        except Exception:
+            return []
+        visitor = CVASTVisitor(file_path, self.root)
+        visitor.visit(tree)
+        return visitor.issues
 
     def analyze(self) -> list[Issue]:
         ignore_tokens = self.cfg["watch"]["ignore"]
-        # Also exclude files in checks.exclude_paths (e.g. bug_bodyguard.py itself)
         check_excludes = list(self.cfg.get("checks", {}).get("exclude_paths") or [])
-        all_ignore = list(ignore_tokens) + check_excludes
-        py_files = collect_python_files(self.root, all_ignore)
-        issues: list[Issue] = []
+        py_files = collect_python_files(self.root, list(ignore_tokens) + check_excludes)
+
+        cache = self._load_cache()
+        new_cache: dict[str, Any] = {}
+        all_issues: list[Issue] = []
+        to_analyze: list[pathlib.Path] = []
+
         for file_path in py_files:
             try:
-                source = file_path.read_text(encoding="utf-8", errors="replace")
-                tree = ast.parse(source, filename=str(file_path))
-            except SyntaxError:
-                continue  # already caught by compileall check
+                rel = file_path.relative_to(self.root).as_posix()
+                digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
             except Exception:
+                to_analyze.append(file_path)
                 continue
-            visitor = CVASTVisitor(file_path, self.root)
-            visitor.visit(tree)
-            issues.extend(visitor.issues)
-        return issues
+            entry = cache.get(rel)
+            if entry and entry.get("sha256") == digest:
+                # File unchanged — restore cached issues
+                for d in entry.get("issues", []):
+                    try:
+                        all_issues.append(Issue(**d))
+                    except Exception:
+                        pass
+                new_cache[rel] = entry
+            else:
+                to_analyze.append(file_path)
+
+        # Analyze changed/new files — parallel for large sets, sequential for small
+        n_workers = min(8, max(1, os.cpu_count() or 4))
+        if len(to_analyze) > 6:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = {pool.submit(self._analyze_file, f): f for f in to_analyze}
+                for future in as_completed(futures):
+                    file_path = futures[future]
+                    try:
+                        issues = future.result()
+                    except Exception:
+                        issues = []
+                    all_issues.extend(issues)
+                    try:
+                        rel = file_path.relative_to(self.root).as_posix()
+                        digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+                        new_cache[rel] = {
+                            "sha256": digest,
+                            "issues": [dataclasses.asdict(i) for i in issues],
+                        }
+                    except Exception:
+                        pass
+        else:
+            for file_path in to_analyze:
+                issues = self._analyze_file(file_path)
+                all_issues.extend(issues)
+                try:
+                    rel = file_path.relative_to(self.root).as_posix()
+                    digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+                    new_cache[rel] = {
+                        "sha256": digest,
+                        "issues": [dataclasses.asdict(i) for i in issues],
+                    }
+                except Exception:
+                    pass
+
+        self._save_cache(new_cache)
+        return all_issues
 
 
 class FixPlanner:
@@ -2727,18 +2783,28 @@ class BodyguardAgent:
 
     def scan(self, changed_paths: list[pathlib.Path] | None = None) -> pathlib.Path:
         changed_paths = changed_paths or []
+        t_start = time.perf_counter()
+
         with self.telemetry.span("scan", changed_files=len(changed_paths)):
             with self.telemetry.span("index_rebuild"):
                 py_count, _ = self.indexer.rebuild()
-            print(f"[scan] Rebuilt code index ({py_count} Python files).")
+
+            print(f"[scan] {py_count} Python file(s) indexed. Running checks...")
             with self.telemetry.span("checks_run"):
                 check_results = self.checks.run_all(changed_paths)
+
+            passed = sum(1 for r in check_results if r.returncode == 0)
+            failed = len(check_results) - passed
+            print(f"[scan] Checks done: {passed} passed, {failed} failed.")
+
             with self.telemetry.span("issue_detection"):
                 issues = self.detector.detect(check_results)
+
+            print(f"[scan] Static CV analysis (cache-aware, parallel)...")
             with self.telemetry.span("cv_static_analysis"):
                 static_issues = self.cv_analyzer.analyze()
-                print(f"[scan] CV static analysis: {len(static_issues)} issue(s) found across codebase.")
                 issues = _merge_issues(issues, static_issues)
+
             with self.telemetry.span("fix_planning"):
                 heuristic_proposals = [self.validator.validate(p) for p in self.fix_planner.build_proposals(issues)]
             with self.telemetry.span("ruff_diff_proposals"):
@@ -2747,6 +2813,8 @@ class BodyguardAgent:
                 ]
             proposals = merge_heuristic_and_ruff_proposals(heuristic_proposals, ruff_proposals)
             check_results, issues, proposals = self._maybe_auto_apply_guarded(check_results, issues, proposals)
+
+        elapsed = time.perf_counter() - t_start
         report = self.reporter.write(check_results, issues, proposals, changed_paths, static_issues)
         self.notifier.publish(issues, proposals, report)
         self.telemetry.emit(
@@ -2757,9 +2825,11 @@ class BodyguardAgent:
             proposals=len(proposals),
             report=report.as_posix(),
         )
+        ready = sum(1 for p in proposals if p.validated)
         print(
-            f"[scan] done: checks={len(check_results)} issues={len(issues)} "
-            f"static={len(static_issues)} proposals={len(proposals)} report={report}"
+            f"[scan] Done in {elapsed:.1f}s — "
+            f"{len(issues)} bug(s) found, {len(static_issues)} static, "
+            f"{ready}/{len(proposals)} patch(es) ready — {report.name}"
         )
         return report
 
