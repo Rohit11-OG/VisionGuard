@@ -3087,37 +3087,129 @@ def install_optional_dependencies() -> None:
         print("[bootstrap] npm not found; skipping basedpyright install.")
 
 
+def clean_project(root: pathlib.Path, config_path: pathlib.Path, yes: bool = False) -> int:
+    """Remove every file and directory VisionGuard wrote into the project."""
+    removed: list[str] = []
+    skipped: list[str] = []
+
+    targets_dirs = [root / ".agent"]
+    targets_files = [
+        config_path,
+        root / ".vscode" / "tasks.json",
+        root / ".vscode" / "settings.json",
+    ]
+
+    # Collect what actually exists
+    to_remove_dirs = [p for p in targets_dirs if p.exists()]
+    to_remove_files = [p for p in targets_files if p.exists()]
+
+    if not to_remove_dirs and not to_remove_files:
+        print("[clean] Nothing to remove — project is already clean.")
+        return 0
+
+    print("[clean] The following will be permanently deleted from your project:")
+    print()
+    for p in to_remove_dirs:
+        print(f"  [DIR]  {p.relative_to(root).as_posix()}/")
+    for p in to_remove_files:
+        print(f"  [FILE] {p.relative_to(root).as_posix()}")
+    print()
+
+    if not yes:
+        try:
+            answer = input("Continue? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in {"y", "yes"}:
+            print("[clean] Aborted. Nothing removed.")
+            return 0
+
+    for p in to_remove_dirs:
+        try:
+            shutil.rmtree(p)
+            removed.append(p.relative_to(root).as_posix() + "/")
+        except Exception as exc:
+            skipped.append(f"{p.relative_to(root).as_posix()}/ ({exc})")
+
+    for p in to_remove_files:
+        try:
+            p.unlink()
+            removed.append(p.relative_to(root).as_posix())
+            # Remove parent .vscode dir if now empty
+            if p.parent.name == ".vscode" and p.parent.exists():
+                remaining = list(p.parent.iterdir())
+                if not remaining:
+                    p.parent.rmdir()
+                    removed.append(".vscode/")
+        except Exception as exc:
+            skipped.append(f"{p.relative_to(root).as_posix()} ({exc})")
+
+    print()
+    if removed:
+        print("[clean] Removed:")
+        for r in removed:
+            print(f"  - {r}")
+    if skipped:
+        print("[clean] Could not remove (check permissions):")
+        for s in skipped:
+            print(f"  - {s}")
+
+    print()
+    print("[clean] Project directory is clean.")
+    print()
+    print("  To also uninstall the visionguard CLI tool from your system:")
+    print("    pip uninstall visionguard -y")
+    return 0
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="bug_bodyguard.py",
-        description="Drop-in Python bug bodyguard agent (safe patch mode).",
+        prog="visionguard",
+        description="VisionGuard — deep static + runtime bug detection for CV projects.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
             """
             Examples:
-              python bug_bodyguard.py bootstrap --install-optional-deps
-              python bug_bodyguard.py init
-              python bug_bodyguard.py scan
-              python bug_bodyguard.py scan src/app.py
-              python bug_bodyguard.py watch
-              python bug_bodyguard.py report --latest 3
+              visionguard bootstrap              # one-time project setup
+              visionguard scan                   # scan for bugs now
+              visionguard scan src/camera.py     # scan specific file
+              visionguard watch                  # auto-scan on every save
+              visionguard report --latest 5      # list recent reports
+              visionguard clean                  # remove all agent files from project
+              visionguard clean --yes            # remove without confirmation prompt
             """
         ),
     )
-    parser.add_argument("--root", default=".", help="Project root directory")
-    parser.add_argument("--config", default="agent.yml", help="Config filename")
+    parser.add_argument("--root", default=".", help="Project root directory (default: current dir)")
+    parser.add_argument("--config", default="agent.yml", help="Config filename (default: agent.yml)")
 
     sub = parser.add_subparsers(dest="command", required=True)
-    boot = sub.add_parser("bootstrap", help="One-file setup: init + optional VS Code + optional deps")
-    boot.add_argument("--install-optional-deps", action="store_true", help="Install optional frameworks/tools")
-    boot.add_argument("--no-vscode", action="store_true", help="Skip creating VS Code auto-start files")
-    boot.add_argument("--start-watch", action="store_true", help="Immediately start watch after setup")
+
+    boot = sub.add_parser("bootstrap", help="One-time setup: config + VS Code tasks + optional deps")
+    boot.add_argument("--install-optional-deps", action="store_true", help="Install optional tools (ruff, watchfiles, libcst, ...)")
+    boot.add_argument("--no-vscode", action="store_true", help="Skip VS Code task files")
+    boot.add_argument("--start-watch", action="store_true", help="Start watch mode immediately after setup")
+
     sub.add_parser("init", help="Create default config and .agent directories")
-    scan = sub.add_parser("scan", help="Run checks and generate report")
-    scan.add_argument("paths", nargs="*", help="Optional changed file paths")
-    sub.add_parser("watch", help="Continuously monitor and scan on changes")
-    rep = sub.add_parser("report", help="List latest reports")
-    rep.add_argument("--latest", type=int, default=5, help="How many report paths to print")
+
+    scan = sub.add_parser("scan", help="Run all checks and generate a numbered bug report")
+    scan.add_argument("paths", nargs="*", help="Optional: specific files to mark as changed")
+
+    sub.add_parser("watch", help="Watch for file changes and auto-scan on every save")
+
+    rep = sub.add_parser("report", help="List recent reports")
+    rep.add_argument("--latest", type=int, default=5, help="Number of reports to show (default: 5)")
+
+    cln = sub.add_parser(
+        "clean",
+        help="Remove all VisionGuard files from this project (.agent/, agent.yml, .vscode tasks)",
+    )
+    cln.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Skip confirmation prompt and remove immediately",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -3144,6 +3236,9 @@ def main(argv: list[str] | None = None) -> int:
         agent = BodyguardAgent(root, config_path)
         agent.init_workspace()
         return 0
+
+    if args.command == "clean":
+        return clean_project(root, config_path, yes=bool(args.yes))
 
     if not config_path.exists():
         print("[bootstrap] missing config, creating default setup automatically.")

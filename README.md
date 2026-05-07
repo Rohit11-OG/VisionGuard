@@ -52,6 +52,35 @@ Reports are written to `.agent/reports/report_1.md`, `report_2.md`, ... — each
 
 ---
 
+## Remove / Uninstall
+
+### Remove agent files from a project
+
+Deletes `.agent/`, `agent.yml`, and the VS Code task files VisionGuard created.  
+Your actual source code is never touched.
+
+```bash
+# Interactive — asks for confirmation
+visionguard clean
+
+# Skip confirmation prompt
+visionguard clean --yes
+```
+
+### Also remove the CLI tool from your system
+
+```bash
+pip uninstall visionguard -y
+```
+
+### Full removal (project files + CLI)
+
+```bash
+visionguard clean --yes && pip uninstall visionguard -y
+```
+
+---
+
 ## What It Detects
 
 ### CV Static Analysis — no test run needed (AST)
