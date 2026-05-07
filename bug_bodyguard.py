@@ -1384,7 +1384,7 @@ def root_cause_hypothesis(issue: Issue) -> str:
         return "Use device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') and .to(device). Never hardcode .cuda() or .to('cuda')."
     if "videocapture" in title or "isoopened" in text or "cap.read" in text:
         return "cv2.VideoCapture silently fails on wrong index. Check cap.isOpened() before cap.read() and release cap in finally block."
-    if "imwrite" in title and "discarded" in title:
+    if "imwrite" in title:
         return "cv2.imwrite() silently returns False on failure. Check: ok = cv2.imwrite(path, img); assert ok."
     if "daemon" in title or "thread" in title and "blocks" in title:
         return "Camera/worker threads must be daemon=True so they die when main thread exits. Or call .join(timeout=...) on shutdown."
@@ -2473,6 +2473,15 @@ class ReportWriter:
         self.report_dir = root / cfg["reporting"]["path"]
         self.patch_dir = root / ".agent" / "patches"
 
+    def _next_report_number(self) -> int:
+        ensure_dir(self.report_dir)
+        max_n = 0
+        for p in self.report_dir.glob("report_*.md"):
+            m = re.match(r"report_(\d+)\.md$", p.name)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+        return max_n + 1
+
     def write(
         self,
         check_results: list[CheckResult],
@@ -2489,119 +2498,129 @@ class ReportWriter:
             patch_file = self.patch_dir / f"{proposal.proposal_id}.patch"
             patch_file.write_text(proposal.patch, encoding="utf-8")
 
+        report_num = self._next_report_number()
+
+        # Merge all issues into one ranked list: severity first, then confidence
+        all_bugs = sorted(
+            issues,
+            key=lambda i: (severity_rank(i.severity), -i.confidence),
+        )
+
+        # Build issue_id -> bug_number map for patch cross-references
+        bug_num_map: dict[str, int] = {bug.issue_id: idx + 1 for idx, bug in enumerate(all_bugs)}
+
+        ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        scan_summary = "  |  ".join(
+            f"{r.name} {'PASS' if r.returncode == 0 else 'FAIL'}" for r in check_results
+        )
+        auto_applied = [p for p in proposals if p.auto_applied]
+        ready_patches = [p for p in proposals if p.validated and not p.auto_applied]
+
         lines: list[str] = []
-        lines.append("# Bug Bodyguard Report")
+        lines.append(f"# VisionGuard Report #{report_num}")
         lines.append("")
-        lines.append(f"- Generated at: `{utc_ts()}`")
-        lines.append(f"- Mode: `{self.cfg.get('mode', 'unknown')}`")
-        lines.append(f"- Changed files observed: `{len(changed_files)}`")
-        lines.append(f"- Checks run: `{len(check_results)}`")
-        lines.append(f"- Runtime issues detected: `{len([i for i in issues if i.source_check != 'cv_static'])}`")
-        lines.append(f"- CV static analysis issues: `{len(static_issues)}`")
-        lines.append(f"- Total issues: `{len(issues)}`")
-        lines.append(f"- Patch proposals: `{len(proposals)}`")
-        lines.append(f"- Auto-applied patches: `{len([p for p in proposals if p.auto_applied])}`")
+        lines.append(f"**Scan time:** {ts}  ")
+        lines.append(f"**Files scanned:** {len(changed_files)} changed  ")
+        lines.append(f"**Checks:** {scan_summary}  ")
+        lines.append(f"**Total bugs found:** {len(all_bugs)}  ")
+        lines.append(f"**Auto-fix patches ready:** {len(ready_patches)}  ")
+        lines.append(f"**Auto-applied patches:** {len(auto_applied)}  ")
+        lines.append("")
+        lines.append("---")
         lines.append("")
 
-        lines.append("## Check Results")
-        for result in check_results:
-            status = "PASS" if result.returncode == 0 else "FAIL"
-            lines.append(
-                f"- `{result.name}`: **{status}** (`{result.command}`) in `{result.duration_seconds:.1f}s`"
-            )
-            if result.returncode != 0:
+        # ── Unified numbered bug list ─────────────────────────────────────────
+        lines.append(f"## Bugs Found ({len(all_bugs)})")
+        lines.append("")
+        if not all_bugs:
+            lines.append("No bugs detected.")
+        else:
+            SEV_ICON = {"critical": "[CRITICAL]", "high": "[HIGH]", "medium": "[MEDIUM]", "low": "[LOW]"}
+            SOURCE_LABEL = {"cv_static": "CV Static (AST)", "compileall": "Compile", "pytest": "pytest",
+                            "unittest": "unittest", "ruff": "Ruff", "basedpyright": "Type Check"}
+            for idx, bug in enumerate(all_bugs, start=1):
+                sev_icon = SEV_ICON.get(bug.severity, "[LOW]")
+                src_label = SOURCE_LABEL.get(bug.source_check, bug.source_check)
+                loc = f"`{bug.file_path}` line {bug.line}" if bug.file_path and bug.line else (
+                    f"`{bug.file_path}`" if bug.file_path else "location unknown"
+                )
+                lines.append(f"### Bug #{idx} — {sev_icon} {bug.title}")
+                lines.append("")
+                lines.append(f"| Field | Detail |")
+                lines.append(f"|---|---|")
+                lines.append(f"| **Location** | {loc} |")
+                lines.append(f"| **Detected by** | {src_label} |")
+                lines.append(f"| **Confidence** | {bug.confidence:.0%} |")
+                lines.append(f"| **Description** | {bug.description} |")
+                lines.append(f"| **How to fix** | {root_cause_hypothesis(bug)} |")
+                lines.append("")
+                ctx = read_source_context(bug.file_path, bug.line, self.root)
+                if ctx:
+                    lines.append("```python")
+                    lines.append(ctx)
+                    lines.append("```")
+                    lines.append("")
+                elif bug.evidence:
+                    lines.append("```text")
+                    lines.append(trim_text(bug.evidence, 400))
+                    lines.append("```")
+                    lines.append("")
+
+        lines.append("---")
+        lines.append("")
+
+        # ── Auto-fix patches ──────────────────────────────────────────────────
+        if proposals:
+            lines.append(f"## Auto-Fix Patches ({len(proposals)})")
+            lines.append("")
+            for pidx, proposal in enumerate(proposals, start=1):
+                bug_n = bug_num_map.get(proposal.issue_id, "?")
+                status_parts = []
+                if proposal.validated:
+                    status_parts.append("Validated ✓")
+                else:
+                    status_parts.append(f"Validation failed: {proposal.validation_note}")
+                if proposal.auto_applied:
+                    status_parts.append("Auto-applied ✓")
+                elif proposal.apply_note and proposal.apply_note != "Not applied.":
+                    status_parts.append(proposal.apply_note)
+                else:
+                    status_parts.append("Not applied — review and apply manually")
+                status = " | ".join(status_parts)
+                lines.append(f"### Patch #{pidx} — {proposal.summary}")
+                lines.append("")
+                lines.append(f"| Field | Detail |")
+                lines.append(f"|---|---|")
+                lines.append(f"| **File** | `{proposal.file_path}` |")
+                lines.append(f"| **Fixes** | Bug #{bug_n} |")
+                lines.append(f"| **Confidence** | {proposal.confidence:.0%} |")
+                lines.append(f"| **Status** | {status} |")
+                lines.append("")
+                if proposal.patch:
+                    lines.append("```diff")
+                    # Show only the hunk lines (skip --- +++ headers for brevity)
+                    patch_lines = [ln for ln in proposal.patch.splitlines()
+                                   if not ln.startswith("--- ") and not ln.startswith("+++ ")]
+                    lines.append("\n".join(patch_lines))
+                    lines.append("```")
+                lines.append("")
+            lines.append("---")
+            lines.append("")
+
+        # ── Check output (failures only) ──────────────────────────────────────
+        failed_checks = [r for r in check_results if r.returncode != 0]
+        if failed_checks:
+            lines.append("## Check Output (Failures)")
+            lines.append("")
+            for result in failed_checks:
+                lines.append(f"### `{result.name}` — FAILED (exit {result.returncode}, {result.duration_seconds:.1f}s)")
                 lines.append("")
                 lines.append("```text")
                 lines.append(trim_text(result.combined_output or "(no output)", 1200))
                 lines.append("```")
                 lines.append("")
 
-        lines.append("## Issues")
-        if not issues:
-            lines.append("- No issues detected by configured checks.")
-        else:
-            bucket_order = ("app_code", "agent_dropin", "tooling_or_cache", "dependencies", "unknown")
-            bucket_labels = {
-                "app_code": "Application code",
-                "agent_dropin": "Agent / drop-in scripts",
-                "tooling_or_cache": "Tooling, cache, or excluded paths",
-                "dependencies": "Dependencies / virtualenv",
-                "unknown": "Unknown / other",
-            }
-            buckets: dict[str, list[Issue]] = {}
-            for issue in issues:
-                b = classify_issue_bucket(issue.file_path, self.root, self.cfg)
-                buckets.setdefault(b, []).append(issue)
-            extra_keys = [k for k in buckets if k not in bucket_order]
-            for key in list(bucket_order) + sorted(extra_keys):
-                group = buckets.get(key) or []
-                if not group:
-                    continue
-                lines.append("")
-                lines.append(f"### {bucket_labels.get(key, key)} (`{key}`)")
-                for issue in group:
-                    loc = f"{issue.file_path}:{issue.line}" if issue.file_path and issue.line else "n/a"
-                    lines.append(
-                        f"- `{issue.issue_id}` [{issue.severity}] ({issue.confidence:.2f}) at `{loc}` - {issue.title}: {issue.description}"
-                    )
-                    lines.append(f"  - Root-cause hypothesis: {root_cause_hypothesis(issue)}")
-
-        lines.append("")
-        lines.append("## CV Static Analysis")
-        if not static_issues:
-            lines.append("- No CV anti-pattern issues detected.")
-        else:
-            # Group by file for readability
-            by_file: dict[str, list[Issue]] = {}
-            for issue in static_issues:
-                key = issue.file_path or "unknown"
-                by_file.setdefault(key, []).append(issue)
-            for file_key in sorted(by_file):
-                lines.append("")
-                lines.append(f"### `{file_key}`")
-                for issue in by_file[file_key]:
-                    loc = f"line {issue.line}" if issue.line else "n/a"
-                    lines.append(
-                        f"- [{issue.severity.upper()}] ({issue.confidence:.2f}) {loc} — **{issue.title}**"
-                    )
-                    lines.append(f"  - {issue.description}")
-                    lines.append(f"  - Fix: {root_cause_hypothesis(issue)}")
-                    ctx = read_source_context(issue.file_path, issue.line, self.root)
-                    if ctx:
-                        lines.append("  ```python")
-                        for ctx_line in ctx.splitlines():
-                            lines.append(f"  {ctx_line}")
-                        lines.append("  ```")
-
-        lines.append("")
-        lines.append("## Patch Proposals")
-        if not proposals:
-            lines.append("- No safe heuristic patch generated (manual review needed).")
-        else:
-            by_source: dict[str, list[PatchProposal]] = {}
-            for proposal in proposals:
-                by_source.setdefault(proposal.proposal_source, []).append(proposal)
-            src_order = ("heuristic", "ruff-diff", "libcst", "other")
-            for src in list(src_order) + sorted(s for s in by_source if s not in src_order):
-                group = by_source.get(src)
-                if not group:
-                    continue
-                lines.append("")
-                lines.append(f"### Source: `{src}` ({len(group)})")
-                for proposal in group:
-                    patch_path = self.patch_dir / f"{proposal.proposal_id}.patch"
-                    lines.append(
-                        f"- `{proposal.proposal_id}` for issue `{proposal.issue_id}` on `{proposal.file_path}` "
-                        f"(confidence {proposal.confidence:.2f}, source `{proposal.proposal_source}`)"
-                    )
-                    lines.append(f"  - Summary: {proposal.summary}")
-                    lines.append(f"  - Validated: `{proposal.validated}`")
-                    lines.append(f"  - Validation note: {proposal.validation_note}")
-                    lines.append(f"  - Auto applied: `{proposal.auto_applied}`")
-                    lines.append(f"  - Apply note: {proposal.apply_note}")
-                    lines.append(f"  - Patch file: `{patch_path.relative_to(self.root).as_posix()}`")
-
-        filename = self.report_dir / f"report_{now_stamp()}.md"
+        filename = self.report_dir / f"report_{report_num}.md"
         filename.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return filename
 
