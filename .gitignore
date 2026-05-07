@@ -20,6 +20,11 @@ env/
 # VS Code (keep tasks.json for autostart, ignore user settings)
 .vscode/settings.json
 
+# Pip build artifacts
+*.egg-info/
+dist/
+build/
+
 # OS
 .DS_Store
 Thumbs.db

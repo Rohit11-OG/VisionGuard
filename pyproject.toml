@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "visionguard"
+version = "1.1.0"
+description = "Deep static + runtime bug detection agent for Python computer vision projects"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = [
+    "computer-vision", "debugging", "static-analysis",
+    "yolo", "realsense", "pytorch", "opencv", "bug-detection",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# No hard dependencies — runs on stdlib only.
+# Optional extras install extra speed/quality tools.
+dependencies = []
+
+[project.optional-dependencies]
+full = [
+    "watchfiles",
+    "watchdog",
+    "ruff",
+    "libcst",
+    "opentelemetry-api",
+    "opentelemetry-sdk",
+]
+
+[project.scripts]
+visionguard = "bug_bodyguard:main"
+
+[tool.setuptools]
+py-modules = ["bug_bodyguard"]
+
+[project.urls]
+Homepage = "https://github.com/Rohit11-OG/VisionGuard"
+Repository = "https://github.com/Rohit11-OG/VisionGuard"
+Issues = "https://github.com/Rohit11-OG/VisionGuard/issues"
