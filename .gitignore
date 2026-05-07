@@ -1,0 +1,25 @@
+# Agent runtime artifacts
+.agent/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Lint/type cache
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# VS Code (keep tasks.json for autostart, ignore user settings)
+.vscode/settings.json
+
+# OS
+.DS_Store
+Thumbs.db

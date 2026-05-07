@@ -1,0 +1,79 @@
+{
+  "mode": "guarded_auto_apply",
+  "watch": {
+    "paths": [
+      "."
+    ],
+    "ignore": [
+      ".git",
+      ".agent",
+      "venv",
+      ".venv",
+      "__pycache__",
+      ".mypy_cache",
+      ".pytest_cache"
+    ],
+    "debounce_seconds": 2,
+    "poll_seconds": 2,
+    "run_initial_scan": true
+  },
+  "checks": {
+    "commands": [
+      {
+        "name": "compileall",
+        "command": "python -m compileall -q ."
+      },
+      {
+        "name": "unittest",
+        "command": "python -m unittest discover -q"
+      },
+      {
+        "name": "ruff",
+        "command": "python -m ruff check .",
+        "optional": true
+      },
+      {
+        "name": "basedpyright",
+        "command": "basedpyright",
+        "optional": true
+      },
+      {
+        "name": "semgrep",
+        "command": "semgrep --config auto --error",
+        "optional": true
+      }
+    ],
+    "timeout_seconds": 120,
+    "run_impacted_tests": true,
+    "impacted_test_limit": 20
+  },
+  "llm": {
+    "provider": "none",
+    "model": "",
+    "api_key_env": "OPENAI_API_KEY"
+  },
+  "fixes": {
+    "prefer_libcst": true
+  },
+  "reporting": {
+    "path": ".agent/reports",
+    "verbosity": "normal"
+  },
+  "notifications": {
+    "enabled": true,
+    "console": true,
+    "summary_file": ".agent/last_notification.txt",
+    "min_confidence": 0.75
+  },
+  "auto_apply": {
+    "enabled": true,
+    "min_confidence": 0.74,
+    "max_patches_per_scan": 1,
+    "require_all_checks_pass_after_apply": true,
+    "preview_only": false
+  },
+  "telemetry": {
+    "enabled": true,
+    "events_path": ".agent/telemetry/events.jsonl"
+  }
+}
