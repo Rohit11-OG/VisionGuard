@@ -676,6 +676,20 @@ class BugDetector:
         r"RuntimeError: main thread is not in main loop)"
         r"[^\n]*)"
     )
+    # General runtime errors
+    ZERO_DIV_RE = re.compile(r"ZeroDivisionError:\s*(?P<msg>[^\n]+)")
+    FILE_NOT_FOUND_RE = re.compile(
+        r"(?:FileNotFoundError|OSError|IOError):\s*(?P<msg>(?:\[Errno \d+\]\s*)?[^\n]+)"
+    )
+    RECURSION_ERROR_RE = re.compile(r"RecursionError:\s*(?P<msg>[^\n]+)")
+    MEMORY_ERROR_RE = re.compile(r"(?:MemoryError|OutOfMemoryError):\s*(?P<msg>[^\n]*)")
+    TORCH_CUDA_MAP_RE = re.compile(
+        r"(?P<msg>"
+        r"(?:Attempting to deserialize object on a CUDA device|"
+        r"Expected all tensors to be on the same device|"
+        r"Cannot copy out of meta tensor)"
+        r"[^\n]*)"
+    )
 
     def detect(self, checks: list[CheckResult]) -> list[Issue]:
         issues: list[Issue] = []
@@ -698,6 +712,11 @@ class BugDetector:
             issues.extend(self._parse_realsense_errors(result.name, output))
             issues.extend(self._parse_yolo_errors(result.name, output))
             issues.extend(self._parse_thread_errors(result.name, output))
+            issues.extend(self._parse_zero_div_errors(result.name, output))
+            issues.extend(self._parse_file_not_found_errors(result.name, output))
+            issues.extend(self._parse_recursion_errors(result.name, output))
+            issues.extend(self._parse_memory_errors(result.name, output))
+            issues.extend(self._parse_torch_cuda_map_errors(result.name, output))
             issues.extend(self._parse_lint_lines(result.name, output))
             issues.extend(self._parse_tracebacks(result.name, output))
             if not issues_for_check(issues, result.name):
@@ -1036,6 +1055,108 @@ class BugDetector:
             ))
         return found
 
+    def _parse_zero_div_errors(self, check_name: str, output: str) -> list[Issue]:
+        found: list[Issue] = []
+        for match in self.ZERO_DIV_RE.finditer(output):
+            message = match.group("msg").strip()
+            file_path, line = self._extract_frame(output, match.start())
+            if not file_path:
+                continue
+            issue_id = f"zerodiv-{short_hash(f'{file_path}:{line}:{message}')}"
+            found.append(Issue(
+                issue_id=issue_id,
+                source_check=check_name,
+                title="ZeroDivisionError detected",
+                description=message,
+                severity="high",
+                confidence=0.90,
+                file_path=file_path,
+                line=line,
+                evidence=trim_text(message, 300),
+            ))
+        return found
+
+    def _parse_file_not_found_errors(self, check_name: str, output: str) -> list[Issue]:
+        found: list[Issue] = []
+        for match in self.FILE_NOT_FOUND_RE.finditer(output):
+            message = match.group("msg").strip()
+            # Skip OS-level noise that's not about model/data files
+            if not any(kw in message.lower() for kw in ("pt", "pth", "onnx", "yaml", "cfg", "weight", "model", "data", "path", "no such")):
+                continue
+            file_path, line = self._extract_frame(output, match.start())
+            if not file_path:
+                continue
+            issue_id = f"filenotfound-{short_hash(f'{file_path}:{line}:{message}')}"
+            found.append(Issue(
+                issue_id=issue_id,
+                source_check=check_name,
+                title="FileNotFoundError — missing model/data file",
+                description=message,
+                severity="high",
+                confidence=0.84,
+                file_path=file_path,
+                line=line,
+                evidence=trim_text(message, 300),
+            ))
+        return found
+
+    def _parse_recursion_errors(self, check_name: str, output: str) -> list[Issue]:
+        found: list[Issue] = []
+        for match in self.RECURSION_ERROR_RE.finditer(output):
+            message = match.group("msg").strip()
+            file_path, line = self._extract_frame(output, match.start())
+            issue_id = f"recursionerr-{short_hash(f'{file_path}:{line}:{message}')}"
+            found.append(Issue(
+                issue_id=issue_id,
+                source_check=check_name,
+                title="RecursionError — infinite recursion or deep call stack",
+                description=message,
+                severity="high",
+                confidence=0.88,
+                file_path=file_path,
+                line=line,
+                evidence=trim_text(message, 300),
+            ))
+        return found
+
+    def _parse_memory_errors(self, check_name: str, output: str) -> list[Issue]:
+        found: list[Issue] = []
+        for match in self.MEMORY_ERROR_RE.finditer(output):
+            message = match.group("msg").strip() or "Process ran out of system memory."
+            file_path, line = self._extract_frame(output, match.start())
+            issue_id = f"memerr-{short_hash(f'{file_path}:{line}:{message}')}"
+            found.append(Issue(
+                issue_id=issue_id,
+                source_check=check_name,
+                title="MemoryError — out of RAM",
+                description=message,
+                severity="high",
+                confidence=0.86,
+                file_path=file_path,
+                line=line,
+                evidence=trim_text(message, 300),
+            ))
+        return found
+
+    def _parse_torch_cuda_map_errors(self, check_name: str, output: str) -> list[Issue]:
+        found: list[Issue] = []
+        for match in self.TORCH_CUDA_MAP_RE.finditer(output):
+            message = match.group("msg").strip()
+            file_path, line = self._extract_frame(output, match.start())
+            issue_id = f"torchmap-{short_hash(f'{file_path}:{line}:{message}')}"
+            found.append(Issue(
+                issue_id=issue_id,
+                source_check=check_name,
+                title="torch.load() device mismatch — CUDA weights loaded on CPU",
+                description=message,
+                severity="high",
+                confidence=0.90,
+                file_path=file_path,
+                line=line,
+                evidence=trim_text(message, 300),
+            ))
+        return found
+
     def _parse_lint_lines(self, check_name: str, output: str) -> list[Issue]:
         found: list[Issue] = []
         for match in self.LINT_RE.finditer(output):
@@ -1237,10 +1358,10 @@ def root_cause_hypothesis(issue: Issue) -> str:
         return "Always call frame.is_valid() before frame.get_data() — RealSense returns invalid frames on timeout."
     if "yolo" in title or "ultralytics" in title:
         return "Check model path exists, YOLO version matches ultralytics version, and results.boxes is not None before access."
+    if "queue.get" in title or "queue.empty" in title or "queue.get" in text or "queue.empty" in text:
+        return "Wrap queue.get(timeout=...) in try/except queue.Empty to handle timeout without crash."
     if "thread" in title or "thread" in text:
         return "Access shared state only inside 'with self._lock:'. Use queue for cross-thread data — never share raw attributes."
-    if "queue.get" in text or "queue.empty" in text:
-        return "Wrap queue.get(timeout=...) in try/except queue.Empty to handle timeout without crash."
     if "realsense" in title or "rs2" in text:
         return "Check device connection, release pipeline on exit, and call frame.is_valid() before accessing frame data."
     if "depth" in text and "zero" in text:
@@ -1249,6 +1370,24 @@ def root_cause_hypothesis(issue: Issue) -> str:
         return "Use tensor.detach().cpu().numpy() to safely convert — bare .numpy() fails on GPU tensors or tensors with grad."
     if "bgr" in text or "color channel" in text:
         return "cv2.imread returns BGR. plt.imshow and PIL expect RGB. Use cv2.cvtColor(img, cv2.COLOR_BGR2RGB) before display."
+    if "zerodivision" in title or "zero division" in title:
+        return "Divide-by-zero: check denominator > 0 before dividing. RealSense depth=0 for invalid pixels."
+    if "filenotfound" in title or "missing model" in title or "no such file" in text:
+        return "File not found: verify path exists before loading. Use pathlib.Path(path).exists() or try/except FileNotFoundError."
+    if "recursion" in title:
+        return "Infinite recursion: check base case in recursive function or model __call__ override calling itself."
+    if "memory" in title and "out of" in title:
+        return "Out of RAM: reduce batch size, load data in smaller chunks, or use float16 to halve memory footprint."
+    if "torch.load" in title or "map_location" in title or "deserialize" in text:
+        return "torch.load() without map_location crashes when CUDA weights loaded on CPU. Add map_location='cpu'."
+    if "hardcoded" in title and "cuda" in title:
+        return "Use device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') and .to(device). Never hardcode .cuda() or .to('cuda')."
+    if "videocapture" in title or "isoopened" in text or "cap.read" in text:
+        return "cv2.VideoCapture silently fails on wrong index. Check cap.isOpened() before cap.read() and release cap in finally block."
+    if "imwrite" in title and "discarded" in title:
+        return "cv2.imwrite() silently returns False on failure. Check: ok = cv2.imwrite(path, img); assert ok."
+    if "daemon" in title or "thread" in title and "blocks" in title:
+        return "Camera/worker threads must be daemon=True so they die when main thread exits. Or call .join(timeout=...) on shutdown."
     return "Likely check failure caused by recent code change near referenced location."
 
 
@@ -1270,6 +1409,13 @@ class CVASTVisitor(ast.NodeVisitor):
         self._rs_valid_checked: set[str] = set()     # RS vars that had .is_valid() check
         self._rs_reported: set[str] = set()          # suppress duplicate RS reports
         self._try_handler_stack: list[set[str]] = [] # stack of except handler names per try block
+        # VideoCapture tracking
+        self._videocap_vars: dict[str, int] = {}     # cap = cv2.VideoCapture(...)
+        self._cap_opened_checked: set[str] = set()   # cap.isOpened() seen
+        self._cap_reported: set[str] = set()         # suppress dup reports
+        # torch.load tracking
+        self._no_grad_ctx_depth: int = 0             # nesting depth of torch.no_grad() contexts
+        self._eval_called_vars: set[str] = set()     # model vars that had .eval() called
 
     def _rel(self) -> str:
         try:
@@ -1502,6 +1648,23 @@ class CVASTVisitor(ast.NodeVisitor):
                 name = self._name(target)
                 if name:
                     self._rs_frame_vars[name] = node.lineno
+        # Track cv2.VideoCapture assignments
+        if (isinstance(val, ast.Call)
+                and isinstance(val.func, ast.Attribute)
+                and val.func.attr == "VideoCapture"
+                and isinstance(val.func.value, ast.Name)
+                and val.func.value.id == "cv2"):
+            for target in node.targets:
+                name = self._name(target)
+                if name:
+                    self._videocap_vars[name] = node.lineno
+        # Track .eval() calls: model.eval()
+        if (isinstance(val, ast.Call)
+                and isinstance(val.func, ast.Attribute)
+                and val.func.attr == "eval"):
+            obj_name = self._name(val.func.value)
+            if obj_name:
+                self._eval_called_vars.add(obj_name)
         self.generic_visit(node)
 
     def _check_wait_for_frames_timeout(self, node: ast.Call) -> None:
@@ -1584,15 +1747,13 @@ class CVASTVisitor(ast.NodeVisitor):
             )
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        """Track RealSense is_valid() checks and YOLO None attribute access."""
-        # Track is_valid() calls on RS frame vars
+        """Track RealSense is_valid(), VideoCapture isOpened(), and model .eval() calls."""
         if node.attr == "is_valid" and isinstance(node.value, ast.Name):
             self._rs_valid_checked.add(node.value.id)
-        # Detect bare results.masks / results.boxes attribute access (not inside None check)
-        if node.attr in {"masks", "boxes"} and isinstance(node.value, ast.Name):
-            # Flag direct attribute access on result vars when parent context is not an If/Compare
-            # We flag the more specific chained access in _check_yolo_masks_none
-            pass
+        if node.attr == "isOpened" and isinstance(node.value, ast.Name):
+            self._cap_opened_checked.add(node.value.id)
+        if node.attr == "eval" and isinstance(node.value, ast.Name):
+            self._eval_called_vars.add(node.value.id)
         self.generic_visit(node)
 
     # ── Depth divide-by-zero ─────────────────────────────────────────────────
@@ -1645,8 +1806,9 @@ class CVASTVisitor(ast.NodeVisitor):
             return
         if node.func.attr != "get":
             return
-        # Only flag if timeout keyword is present (otherwise it blocks forever, different issue)
-        has_timeout = any(kw.arg == "timeout" for kw in node.keywords) or len(node.args) >= 2
+        # Only flag when 'timeout' keyword is explicitly present.
+        # Positional-arg count is NOT used because dict.get(key, default) also has 2 args.
+        has_timeout = any(kw.arg == "timeout" for kw in node.keywords)
         if not has_timeout:
             return
         # Check if any enclosing try block catches Empty
@@ -1677,7 +1839,141 @@ class CVASTVisitor(ast.NodeVisitor):
     def _issue_raw(self, **kwargs: Any) -> None:
         self.issues.append(Issue(**kwargs))
 
+    # ── VideoCapture checks ───────────────────────────────────────────────────
+
+    def _check_videocap_read_no_opened(self, node: ast.Call) -> None:
+        """Flag cap.read() / cap.grab() on VideoCapture var not guarded by isOpened()."""
+        if not isinstance(node.func, ast.Attribute):
+            return
+        if node.func.attr not in {"read", "grab"}:
+            return
+        obj_name = self._name(node.func.value)
+        if (obj_name
+                and obj_name in self._videocap_vars
+                and obj_name not in self._cap_opened_checked
+                and obj_name not in self._cap_reported):
+            issue_id = f"cvstatic-cap-noopened-{short_hash(self._rel() + obj_name)}"
+            self._issue(
+                issue_id=issue_id,
+                title=f"cv2.VideoCapture '{obj_name}' used without isOpened() check",
+                desc=(
+                    f"'{obj_name}' created at line {self._videocap_vars[obj_name]}, "
+                    f".{node.func.attr}() called at line {node.lineno} without isOpened() guard. "
+                    "VideoCapture silently fails on wrong camera index or unavailable device."
+                ),
+                line=self._videocap_vars[obj_name],
+                severity="high",
+                confidence=0.86,
+            )
+            self._cap_reported.add(obj_name)
+
+    # ── torch.load map_location check ────────────────────────────────────────
+
+    def _check_torch_load_no_map_location(self, node: ast.Call) -> None:
+        """Flag torch.load(path) without map_location — crashes when CUDA weights loaded on CPU."""
+        if not (isinstance(node.func, ast.Attribute)
+                and node.func.attr == "load"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "torch"):
+            return
+        has_map_location = any(kw.arg == "map_location" for kw in node.keywords)
+        if not has_map_location:
+            issue_id = f"cvstatic-torch-load-nomap-{short_hash(self._rel() + str(node.lineno))}"
+            self._issue(
+                issue_id=issue_id,
+                title="torch.load() missing map_location — device mismatch crash",
+                desc=(
+                    f"Line {node.lineno}: torch.load() without map_location will crash if weights "
+                    "were saved on CUDA but loaded on a CPU-only machine. "
+                    "Use torch.load(path, map_location='cpu') or map_location=torch.device('cpu')."
+                ),
+                line=node.lineno,
+                severity="high",
+                confidence=0.90,
+            )
+
+    # ── Hardcoded CUDA device check ───────────────────────────────────────────
+
+    def _check_hardcoded_cuda(self, node: ast.Call) -> None:
+        """Flag .to('cuda') or .cuda() without torch.cuda.is_available() guard."""
+        if not isinstance(node.func, ast.Attribute):
+            return
+        if node.func.attr == "cuda" and not node.args and not node.keywords:
+            issue_id = f"cvstatic-hardcoded-cuda-{short_hash(self._rel() + str(node.lineno))}"
+            self._issue(
+                issue_id=issue_id,
+                title="Hardcoded .cuda() — crashes on CPU-only machine",
+                desc=(
+                    f"Line {node.lineno}: .cuda() called unconditionally. "
+                    "Use device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') "
+                    "and .to(device) instead."
+                ),
+                line=node.lineno,
+                severity="medium",
+                confidence=0.82,
+            )
+            return
+        if node.func.attr == "to" and node.args:
+            first_arg = node.args[0]
+            if isinstance(first_arg, ast.Constant) and first_arg.value == "cuda":
+                issue_id = f"cvstatic-hardcoded-to-cuda-{short_hash(self._rel() + str(node.lineno))}"
+                self._issue(
+                    issue_id=issue_id,
+                    title='Hardcoded .to("cuda") — crashes on CPU-only machine',
+                    desc=(
+                        f'Line {node.lineno}: .to("cuda") called unconditionally. '
+                        "Use device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') "
+                        "and .to(device) instead."
+                    ),
+                    line=node.lineno,
+                    severity="medium",
+                    confidence=0.82,
+                )
+
+    # ── threading.Thread daemon check ─────────────────────────────────────────
+
+    def _check_thread_no_daemon(self, node: ast.Call) -> None:
+        """Flag threading.Thread(...) without daemon=True — thread prevents clean exit."""
+        if not (isinstance(node.func, ast.Attribute)
+                and node.func.attr == "Thread"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "threading"):
+            return
+        daemon_kw = next((kw for kw in node.keywords if kw.arg == "daemon"), None)
+        if daemon_kw is None:
+            issue_id = f"cvstatic-thread-nodaemon-{short_hash(self._rel() + str(node.lineno))}"
+            self._issue(
+                issue_id=issue_id,
+                title="threading.Thread() without daemon=True — blocks clean program exit",
+                desc=(
+                    f"Line {node.lineno}: Thread created without daemon=True. "
+                    "Non-daemon threads block Python exit if they run forever (camera loops). "
+                    "Add daemon=True or ensure .join() is called on shutdown."
+                ),
+                line=node.lineno,
+                severity="low",
+                confidence=0.72,
+            )
+
     # ── Wire new checks into visit_Call ──────────────────────────────────────
+
+    def visit_Expr(self, node: ast.Expr) -> None:
+        """Flag cv2.imwrite() return value discarded — silent write failure."""
+        if isinstance(node.value, ast.Call) and self._is_cv2_call(node.value, "imwrite"):
+            issue_id = f"cvstatic-imwrite-unchecked-{short_hash(self._rel() + str(node.lineno))}"
+            self._issue(
+                issue_id=issue_id,
+                title="cv2.imwrite() return value discarded — silent failure",
+                desc=(
+                    f"Line {node.lineno}: cv2.imwrite() returns False if write fails "
+                    "(bad path, no disk space, wrong extension). "
+                    "Capture return: ok = cv2.imwrite(...) then assert ok or raise."
+                ),
+                line=node.lineno,
+                severity="low",
+                confidence=0.75,
+            )
+        self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
         self._check_imread_none(node)
@@ -1689,6 +1985,10 @@ class CVASTVisitor(ast.NodeVisitor):
         self._check_rs_frame_used_unchecked(node)
         self._check_yolo_masks_none(node)
         self._check_queue_get_no_handler(node)
+        self._check_videocap_read_no_opened(node)
+        self._check_torch_load_no_map_location(node)
+        self._check_hardcoded_cuda(node)
+        self._check_thread_no_daemon(node)
         self.generic_visit(node)
 
 
@@ -1781,7 +2081,10 @@ class CVStaticAnalyzer:
 
     def analyze(self) -> list[Issue]:
         ignore_tokens = self.cfg["watch"]["ignore"]
-        py_files = collect_python_files(self.root, ignore_tokens)
+        # Also exclude files in checks.exclude_paths (e.g. bug_bodyguard.py itself)
+        check_excludes = list(self.cfg.get("checks", {}).get("exclude_paths") or [])
+        all_ignore = list(ignore_tokens) + check_excludes
+        py_files = collect_python_files(self.root, all_ignore)
         issues: list[Issue] = []
         for file_path in py_files:
             try:
@@ -1883,6 +2186,29 @@ class FixPlanner:
         if "expected ':'" in issue.description and not candidate.rstrip().endswith(":"):
             fixed_lines[idx] = candidate.rstrip() + ":\n"
             summary = "Add missing ':' to fix SyntaxError."
+            confidence = 0.85
+        elif "torch.load() missing map_location" in issue.title:
+            # Find torch.load( in line and add map_location='cpu' before closing paren
+            m = re.search(r"(torch\.load\s*\()([^)]*?)(\))", candidate)
+            if not m:
+                return None
+            args_part = m.group(2).rstrip()
+            # Add map_location kwarg
+            if args_part:
+                new_args = args_part + ", map_location='cpu'"
+            else:
+                new_args = "map_location='cpu'"
+            fixed_line = candidate[: m.start(2)] + new_args + candidate[m.end(2):]
+            fixed_lines[idx] = fixed_line + "\n"
+            summary = "Add map_location='cpu' to torch.load() to prevent CUDA/CPU device mismatch."
+            confidence = 0.88
+        elif "wait_for_frames() called without timeout_ms" in issue.title:
+            m = re.search(r"(\.wait_for_frames\s*\()(\s*\))", candidate)
+            if not m:
+                return None
+            fixed_line = candidate[: m.start(2)] + "timeout_ms=5000" + candidate[m.end(2) - 1:]
+            fixed_lines[idx] = fixed_line + "\n"
+            summary = "Add timeout_ms=5000 to wait_for_frames() to prevent infinite hang on disconnect."
             confidence = 0.85
         elif "not defined" in issue.description:
             missing_name = self._extract_missing_name(issue.description)
@@ -2120,6 +2446,26 @@ def parse_unified_hunks(patch: str) -> list[dict[str, Any]]:
     return hunks
 
 
+def read_source_context(file_path: str | None, line: int | None, root: pathlib.Path, context: int = 3) -> str:
+    """Return ±context lines around the flagged line, with >>> marker on the target line."""
+    if not file_path or not line:
+        return ""
+    try:
+        abs_path = pathlib.Path(file_path) if pathlib.Path(file_path).is_absolute() else root / file_path
+        if not abs_path.exists():
+            return ""
+        src_lines = abs_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        start = max(0, line - context - 1)
+        end = min(len(src_lines), line + context)
+        numbered: list[str] = []
+        for i, src_line in enumerate(src_lines[start:end], start=start + 1):
+            marker = ">>>" if i == line else "   "
+            numbered.append(f"{marker} {i:4d} | {src_line}")
+        return "\n".join(numbered)
+    except Exception:
+        return ""
+
+
 class ReportWriter:
     def __init__(self, root: pathlib.Path, cfg: dict[str, Any]) -> None:
         self.root = root
@@ -2219,7 +2565,13 @@ class ReportWriter:
                         f"- [{issue.severity.upper()}] ({issue.confidence:.2f}) {loc} — **{issue.title}**"
                     )
                     lines.append(f"  - {issue.description}")
-                    lines.append(f"  - Hint: {root_cause_hypothesis(issue)}")
+                    lines.append(f"  - Fix: {root_cause_hypothesis(issue)}")
+                    ctx = read_source_context(issue.file_path, issue.line, self.root)
+                    if ctx:
+                        lines.append("  ```python")
+                        for ctx_line in ctx.splitlines():
+                            lines.append(f"  {ctx_line}")
+                        lines.append("  ```")
 
         lines.append("")
         lines.append("## Patch Proposals")
