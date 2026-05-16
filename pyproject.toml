@@ -39,9 +39,10 @@ full = [
 ]
 
 [project.scripts]
-visionguard = "bug_bodyguard:main"
+visionguard = "visionguard.core:main"
 
 [tool.setuptools]
+packages = ["visionguard"]
 py-modules = ["bug_bodyguard"]
 
 [project.urls]
