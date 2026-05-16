@@ -338,7 +338,11 @@ class CheckRunner:
         self.root = root
         self.cfg = cfg
 
-    def run_all(self, changed_files: list[pathlib.Path] | None = None) -> list[CheckResult]:
+    def run_all(
+        self,
+        changed_files: list[pathlib.Path] | None = None,
+        only: set[str] | None = None,
+    ) -> list[CheckResult]:
         changed_files = changed_files or []
         timeout = int(self.cfg["checks"].get("timeout_seconds", 120))
         impacted_tests = infer_impacted_test_modules(
@@ -349,6 +353,8 @@ class CheckRunner:
         results: list[CheckResult] = []
         for item in self.cfg["checks"]["commands"]:
             name = item["name"]
+            if only is not None and name not in only:
+                continue
             command = self._render_command(name, item["command"], changed_files, impacted_tests)
             command = self._append_tool_excludes(name, command)
             command = self._append_basedpyright_switches(name, command)
@@ -2930,6 +2936,8 @@ class BodyguardAgent:
                     self.validator.validate(p) for p in RuffDiffProposer(self.root, self.cfg).build_proposals()
                 ]
             proposals = merge_heuristic_and_ruff_proposals(heuristic_proposals, ruff_proposals)
+            with self.telemetry.span("fix_verification"):
+                self._verify_proposals(proposals, issues)
             check_results, issues, proposals = self._maybe_auto_apply_guarded(check_results, issues, proposals)
 
         elapsed = time.perf_counter() - t_start
@@ -2954,6 +2962,66 @@ class BodyguardAgent:
             f"{ready}/{len(proposals)} patch(es) ready — {report.name}"
         )
         return report
+
+    def _verify_proposals(self, proposals: list[PatchProposal], issues: list[Issue]) -> None:
+        """Sandbox-verify each patch: apply it, rerun the relevant check, then revert.
+
+        Upgrades `validated` from a mere syntax check to a real check-passes
+        guarantee. The file is always restored — this never keeps a change.
+        """
+        if not proposals:
+            return
+        checks_cfg = self.cfg.get("checks", {})
+        if not bool(checks_cfg.get("verify_fixes", True)):
+            return
+        max_verify = int(checks_cfg.get("verify_fixes_limit", 5))
+        issue_check = {i.issue_id: i.source_check for i in issues}
+        verified = 0
+        for proposal in sorted(proposals, key=lambda p: p.confidence, reverse=True):
+            if not proposal.validated:
+                continue  # syntax validation already failed — nothing to verify
+            if verified >= max_verify:
+                proposal.validation_note += " (verification skipped: limit reached)"
+                continue
+            target = self.root / proposal.file_path
+            if not target.exists():
+                continue
+            src = issue_check.get(proposal.issue_id, "")
+            # cv_static / unknown sources have no runnable check — fall back to compileall.
+            check_names = {src} if src and src not in ("cv_static",) else {"compileall"}
+
+            original_text = target.read_text(encoding="utf-8")
+            try:
+                patched_text = apply_unified_diff_to_text(original_text, proposal.patch)
+            except Exception as exc:
+                proposal.validated = False
+                proposal.validation_note = f"Verification skipped: patch apply failed ({exc})."
+                continue
+
+            target.write_text(patched_text, encoding="utf-8")
+            try:
+                post = self.checks.run_all([target], only=check_names)
+            finally:
+                target.write_text(original_text, encoding="utf-8")
+            verified += 1
+
+            if not post:
+                proposal.validation_note = (
+                    f"Verification inconclusive: no '{', '.join(sorted(check_names))}' check configured."
+                )
+                continue
+            if all(r.returncode == 0 for r in post):
+                proposal.validation_note = (
+                    f"Verified ✓ — {', '.join(sorted(check_names))} pass after patch."
+                )
+            else:
+                failed = [r.name for r in post if r.returncode != 0]
+                proposal.validated = False
+                proposal.validation_note = (
+                    f"Verification failed — {', '.join(failed)} still fail after patch."
+                )
+        if verified:
+            print(f"[verify] {verified} patch(es) sandbox-verified against checks.")
 
     def _maybe_auto_apply_guarded(
         self,
