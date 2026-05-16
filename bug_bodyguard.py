@@ -898,37 +898,52 @@ class BugDetector:
                     for m in self.TRACEBACK_FILE_RE.finditer(output)
                 )
                 if tool_crash:
-                    issues.append(
-                        Issue(
-                            issue_id=f"{result.name}-{short_hash(output[:300] or result.name)}",
-                            source_check=result.name,
-                            title=f"{result.name} tool error (not a code bug)",
-                            description=(
-                                f"The '{result.name}' check tool crashed internally "
-                                f"(return code {result.returncode}). No user code involved."
-                            ),
-                            severity="low",
-                            confidence=0.5,
-                            evidence=trim_text(output, 1200),
-                        )
+                    title = f"{result.name} tool error (not a code bug)"
+                    description = (
+                        f"The '{result.name}' check tool crashed internally "
+                        f"(return code {result.returncode}). No user code involved."
                     )
+                    severity, confidence = "low", 0.5
                 else:
-                    issues.append(
-                        Issue(
-                            issue_id=f"{result.name}-{short_hash(output[:300] or result.name)}",
-                            source_check=result.name,
-                            title=f"{result.name} failed",
-                            description=f"Check command failed with return code {result.returncode}.",
-                            severity="high",
-                            confidence=0.8,
-                            evidence=trim_text(output, 1200),
-                        )
+                    title = f"{result.name} failed"
+                    description = f"Check command failed with return code {result.returncode}."
+                    severity, confidence = "high", 0.8
+                issues.append(
+                    Issue(
+                        issue_id=f"{result.name}-{short_hash(output[:300] or result.name)}",
+                        source_check=result.name,
+                        title=title,
+                        description=description,
+                        severity=severity,
+                        confidence=confidence,
+                        evidence=trim_text(output, 1200),
                     )
+                )
         unique: dict[str, Issue] = {}
         for issue in issues:
             unique[issue.issue_id] = issue
-        ranked = sorted(unique.values(), key=lambda i: (severity_rank(i.severity), -i.confidence))
-        return ranked
+
+        # Collapse noise: several parsers can fire on one crash (e.g. a CUDA
+        # error matches both the CUDA and thread parsers). When issues share a
+        # file+line, keep only the highest-ranked one.
+        def rank(i: Issue) -> tuple[int, float]:
+            return (severity_rank(i.severity), -i.confidence)
+
+        by_loc: dict[tuple[str, int], Issue] = {}
+        deduped: list[Issue] = []
+        for issue in unique.values():
+            if issue.file_path and issue.line:
+                loc = (issue.file_path, issue.line)
+                kept = by_loc.get(loc)
+                if kept is None:
+                    by_loc[loc] = issue
+                    deduped.append(issue)
+                elif rank(issue) < rank(kept):
+                    deduped[deduped.index(kept)] = issue
+                    by_loc[loc] = issue
+            else:
+                deduped.append(issue)
+        return sorted(deduped, key=rank)
 
     def _extract_frame(self, output: str, match_start: int) -> tuple[str | None, int | None]:
         prefix = output[:match_start]

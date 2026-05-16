@@ -133,6 +133,19 @@ class TestTracebackParser(unittest.TestCase):
         self.assertIn("tool error", issues[0].title)
 
 
+class TestIssueDedup(unittest.TestCase):
+    def test_same_location_collapses_to_highest_rank(self) -> None:
+        # A CUDA error in user code matches both the CUDA and thread parsers.
+        out = (
+            "Traceback (most recent call last):\n"
+            '  File "src/infer.py", line 70, in run\n'
+            "RuntimeError: CUDA error: device-side assert triggered in another thread\n"
+        )
+        issues = bg.BugDetector().detect([_check("unittest", 1, out)])
+        locs = [(i.file_path, i.line) for i in issues if i.file_path]
+        self.assertEqual(len(locs), len(set(locs)), "duplicate file+line issues not collapsed")
+
+
 class TestLintParser(unittest.TestCase):
     def test_ruff_line_parsed(self) -> None:
         out = "src/foo.py:10:5: F401 `os` imported but unused\n"
