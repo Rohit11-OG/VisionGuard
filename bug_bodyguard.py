@@ -25,7 +25,8 @@ import textwrap
 import time
 import traceback
 import uuid
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -134,7 +135,7 @@ class PatchProposal:
 
 
 def utc_ts() -> str:
-    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
+    return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
 def now_stamp() -> str:
@@ -307,6 +308,11 @@ class CheckRunner:
                 )
                 continue
             start = time.perf_counter()
+            # Force UTF-8 in child processes — semgrep crashes with UnicodeEncodeError
+            # when its output hits the Windows cp1252 console codec.
+            child_env = dict(os.environ)
+            child_env["PYTHONUTF8"] = "1"
+            child_env["PYTHONIOENCODING"] = "utf-8"
             try:
                 proc = subprocess.run(
                     command,
@@ -317,6 +323,7 @@ class CheckRunner:
                     encoding="utf-8",
                     errors="replace",
                     timeout=timeout,
+                    env=child_env,
                 )
                 result = CheckResult(
                     name=name,
@@ -725,17 +732,38 @@ class BugDetector:
             issues.extend(self._parse_lint_lines(result.name, output))
             issues.extend(self._parse_tracebacks(result.name, output))
             if not issues_for_check(issues, result.name):
-                issues.append(
-                    Issue(
-                        issue_id=f"{result.name}-{short_hash(output[:300] or result.name)}",
-                        source_check=result.name,
-                        title=f"{result.name} failed",
-                        description=f"Check command failed with return code {result.returncode}.",
-                        severity="high",
-                        confidence=0.8,
-                        evidence=trim_text(output, 1200),
-                    )
+                # Distinguish a crash inside the tool itself from a real code bug.
+                tool_crash = bool(self.TRACEBACK_FILE_RE.search(output)) and not any(
+                    self._is_user_frame(sanitize_path(m.group("file")))
+                    for m in self.TRACEBACK_FILE_RE.finditer(output)
                 )
+                if tool_crash:
+                    issues.append(
+                        Issue(
+                            issue_id=f"{result.name}-{short_hash(output[:300] or result.name)}",
+                            source_check=result.name,
+                            title=f"{result.name} tool error (not a code bug)",
+                            description=(
+                                f"The '{result.name}' check tool crashed internally "
+                                f"(return code {result.returncode}). No user code involved."
+                            ),
+                            severity="low",
+                            confidence=0.5,
+                            evidence=trim_text(output, 1200),
+                        )
+                    )
+                else:
+                    issues.append(
+                        Issue(
+                            issue_id=f"{result.name}-{short_hash(output[:300] or result.name)}",
+                            source_check=result.name,
+                            title=f"{result.name} failed",
+                            description=f"Check command failed with return code {result.returncode}.",
+                            severity="high",
+                            confidence=0.8,
+                            evidence=trim_text(output, 1200),
+                        )
+                    )
         unique: dict[str, Issue] = {}
         for issue in issues:
             unique[issue.issue_id] = issue
@@ -1220,9 +1248,10 @@ class BugDetector:
                     user_frames.append((fp, ln, fn))
 
         if not user_frames:
-            # Fall back to last frame regardless of origin
-            last = tb_matches[-1]
-            user_frames = [(sanitize_path(last.group("file")), int(last.group("line")), last.group("func").strip())]
+            # Every frame is tool/stdlib code — this is a crash inside the
+            # check tool itself (e.g. semgrep), not a bug in the user's code.
+            # Do not fabricate stdlib "bugs"; let the generic failure note cover it.
+            return found
 
         # Innermost (last) user frame = highest confidence — where the crash happened
         inner_fp, inner_ln, inner_fn = user_frames[-1]
