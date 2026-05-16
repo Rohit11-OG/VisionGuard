@@ -73,7 +73,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ruff_diff_max_proposals": 40,
     },
     "llm": {"provider": "none", "model": "", "api_key_env": "OPENAI_API_KEY"},
-    "reporting": {"path": ".agent/reports", "verbosity": "normal"},
+    "reporting": {"path": ".agent/reports", "verbosity": "normal", "rolling": True},
     "notifications": {
         "enabled": True,
         "console": True,
@@ -3003,7 +3003,8 @@ class ReportWriter:
             patch_file = self.patch_dir / f"{proposal.proposal_id}.patch"
             patch_file.write_text(proposal.patch, encoding="utf-8")
 
-        report_num = self._next_report_number()
+        rolling = bool(self.cfg["reporting"].get("rolling", True))
+        report_num = 1 if rolling else self._next_report_number()
 
         # Merge all issues into one ranked list: severity first, then confidence
         all_bugs = sorted(
@@ -3022,7 +3023,7 @@ class ReportWriter:
         ready_patches = [p for p in proposals if p.validated and not p.auto_applied]
 
         lines: list[str] = []
-        lines.append(f"# VisionGuard Report #{report_num}")
+        lines.append("# VisionGuard Report" if rolling else f"# VisionGuard Report #{report_num}")
         lines.append("")
         lines.append(f"**Scan time:** {ts}  ")
         lines.append(f"**Files scanned:** {len(changed_files)} changed  ")
@@ -3128,7 +3129,10 @@ class ReportWriter:
                 lines.append("```")
                 lines.append("")
 
-        filename = self.report_dir / f"report_{report_num}.md"
+        # Rolling mode: one overwritten report.md instead of an ever-growing
+        # pile of numbered files (the default — set reporting.rolling: false
+        # to keep a numbered history).
+        filename = self.report_dir / ("report.md" if rolling else f"report_{report_num}.md")
         filename.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return filename
 
@@ -3635,7 +3639,7 @@ class BodyguardAgent:
         report_dir = self.root / self.cfg["reporting"]["path"]
         if not report_dir.exists():
             return []
-        reports = sorted(report_dir.glob("report_*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        reports = sorted(report_dir.glob("report*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
         return reports[:limit]
 
 
