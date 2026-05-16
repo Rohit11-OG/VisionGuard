@@ -2219,8 +2219,11 @@ class CVASTVisitor(ast.NodeVisitor):
 
     # ── Wire new checks into visit_Call ──────────────────────────────────────
 
+    # Tensor transforms that return a NEW tensor — discarding the result is a no-op bug.
+    _NONINPLACE_TENSOR_OPS = frozenset({"to", "cuda", "cpu", "half", "double", "detach"})
+
     def visit_Expr(self, node: ast.Expr) -> None:
-        """Flag cv2.imwrite() return value discarded — silent write failure."""
+        """Flag calls whose return value is silently discarded."""
         if isinstance(node.value, ast.Call) and self._is_cv2_call(node.value, "imwrite"):
             issue_id = f"cvstatic-imwrite-unchecked-{short_hash(self._rel() + str(node.lineno))}"
             self._issue(
@@ -2235,7 +2238,103 @@ class CVASTVisitor(ast.NodeVisitor):
                 severity="low",
                 confidence=0.75,
             )
+        call = node.value
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr in self._NONINPLACE_TENSOR_OPS
+            and not (call.func.attr == "to" and not call.args and not call.keywords)
+        ):
+            attr = call.func.attr
+            issue_id = f"cvstatic-discarded-transform-{short_hash(self._rel() + str(node.lineno))}"
+            self._issue(
+                issue_id=issue_id,
+                title=f".{attr}() result discarded — tensor transform is not in-place",
+                desc=(
+                    f"Line {node.lineno}: '.{attr}(...)' returns a new tensor but the result "
+                    f"is not assigned. Tensor device/dtype transforms never mutate in place — "
+                    f"use 'x = x.{attr}(...)'."
+                ),
+                line=node.lineno,
+                severity="high",
+                confidence=0.78,
+            )
         self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._check_videocapture_leak(node)
+        self._check_realsense_pipeline_leak(node)
+        self.generic_visit(node)
+
+    def _check_videocapture_leak(self, func: ast.AST) -> None:
+        """Flag a cv2.VideoCapture opened in a function but never released."""
+        opened: dict[str, int] = {}
+        released: set[str] = set()
+        for n in ast.walk(func):
+            if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call):
+                if self._is_cv2_call(n.value, "VideoCapture"):
+                    name = self._name(n.targets[0]) if n.targets else None
+                    if name:
+                        opened[name] = n.lineno
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "release"):
+                obj = self._name(n.func.value)
+                if obj:
+                    released.add(obj)
+        for name, line in opened.items():
+            if name in released:
+                continue
+            self._issue(
+                issue_id=f"cvstatic-cap-leak-{short_hash(self._rel() + name + str(line))}",
+                title=f"cv2.VideoCapture '{name}' never released — resource leak",
+                desc=(
+                    f"Line {line}: '{name}' is opened but '{name}.release()' is never called. "
+                    "The camera/file handle leaks; later opens may fail. Call release() or "
+                    "wrap in a try/finally."
+                ),
+                line=line,
+                severity="medium",
+                confidence=0.80,
+            )
+
+    def _check_realsense_pipeline_leak(self, func: ast.AST) -> None:
+        """Flag a RealSense pipeline started in a function but never stopped."""
+        pipeline_vars: set[str] = set()
+        for n in ast.walk(func):
+            if (isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
+                    and isinstance(n.value.func, ast.Attribute)
+                    and n.value.func.attr == "pipeline" and n.targets):
+                name = self._name(n.targets[0])
+                if name:
+                    pipeline_vars.add(name)
+        if not pipeline_vars:
+            return
+        started: dict[str, int] = {}
+        stopped: set[str] = set()
+        for n in ast.walk(func):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                obj = self._name(n.func.value)
+                if not obj or obj not in pipeline_vars:
+                    continue
+                if n.func.attr == "start":
+                    started.setdefault(obj, n.lineno)
+                elif n.func.attr == "stop":
+                    stopped.add(obj)
+        for name, line in started.items():
+            if name in stopped:
+                continue
+            self._issue(
+                issue_id=f"cvstatic-rs-pipeline-leak-{short_hash(self._rel() + name + str(line))}",
+                title=f"RealSense pipeline '{name}' started but never stopped",
+                desc=(
+                    f"Line {line}: '{name}.start()' has no matching '{name}.stop()'. "
+                    "The device stays locked — re-running the program fails to acquire it. "
+                    "Call stop() in a finally block."
+                ),
+                line=line,
+                severity="medium",
+                confidence=0.72,
+            )
 
     def visit_Call(self, node: ast.Call) -> None:
         self._check_imread_none(node)
