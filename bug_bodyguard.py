@@ -334,9 +334,43 @@ def summarize_file(lines: list[str], defs: list[str], classes: list[str]) -> str
 
 
 class CheckRunner:
+    _CACHE_TTL_SECONDS = 24 * 3600
+
     def __init__(self, root: pathlib.Path, cfg: dict[str, Any]) -> None:
         self.root = root
         self.cfg = cfg
+        self._cache_path = root / ".agent" / "index" / "check_cache.json"
+
+    def _project_fingerprint(self) -> str:
+        """Hash of every indexed .py file's path + size + mtime.
+
+        Any source edit changes this, so a cached check result is reused
+        only when nothing the check could read has changed.
+        """
+        ignore = list(self.cfg.get("watch", {}).get("ignore", []))
+        parts: list[str] = []
+        for path in collect_python_files(self.root, ignore):
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            parts.append(f"{to_root_relative(path, self.root)}:{st.st_size}:{st.st_mtime_ns}")
+        return short_hash("\n".join(sorted(parts)))
+
+    def _load_cache(self) -> dict[str, Any]:
+        try:
+            if self._cache_path.exists():
+                return json.loads(self._cache_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+        return {}
+
+    def _save_cache(self, cache: dict[str, Any]) -> None:
+        try:
+            ensure_dir(self._cache_path.parent)
+            self._cache_path.write_text(json.dumps(cache, separators=(",", ":")), encoding="utf-8")
+        except OSError:
+            pass
 
     def run_all(
         self,
@@ -350,63 +384,126 @@ class CheckRunner:
             changed_files,
             int(self.cfg["checks"].get("impacted_test_limit", 20)),
         )
-        results: list[CheckResult] = []
-        for item in self.cfg["checks"]["commands"]:
-            name = item["name"]
-            if only is not None and name not in only:
-                continue
-            command = self._render_command(name, item["command"], changed_files, impacted_tests)
-            command = self._append_tool_excludes(name, command)
-            command = self._append_basedpyright_switches(name, command)
-            if self._should_skip_optional_check(item, command):
-                results.append(
-                    CheckResult(
-                        name=name,
-                        command=command,
-                        returncode=0,
-                        stdout=f"Skipped optional check '{name}' (dependency not available).",
-                        stderr="",
+        pending = [
+            item for item in self.cfg["checks"]["commands"]
+            if only is None or item["name"] in only
+        ]
+        if not pending:
+            return []
+
+        # Result cache: if no .py file changed, a prior check result still holds.
+        # Skipped for `only` (verify-loop) runs — those mutate files mid-scan.
+        use_cache = only is None and bool(self.cfg.get("checks", {}).get("cache_results", True))
+        cache = self._load_cache() if use_cache else {}
+        fingerprint = self._project_fingerprint() if use_cache else ""
+        now = time.time()
+
+        def cache_key(item: dict[str, Any]) -> str:
+            return short_hash(f"{item['name']}|{item['command']}|{fingerprint}")
+
+        slots: list[CheckResult | None] = [None] * len(pending)
+        to_run: list[tuple[int, dict[str, Any]]] = []
+        for idx, item in enumerate(pending):
+            if use_cache:
+                entry = cache.get(cache_key(item))
+                if entry and (now - entry.get("ts", 0)) < self._CACHE_TTL_SECONDS:
+                    slots[idx] = CheckResult(
+                        name=item["name"],
+                        command=entry.get("command", item["command"]),
+                        returncode=entry["returncode"],
+                        stdout=entry["stdout"],
+                        stderr=entry["stderr"],
                         duration_seconds=0.0,
                     )
-                )
-                continue
-            start = time.perf_counter()
-            # Force UTF-8 in child processes — semgrep crashes with UnicodeEncodeError
-            # when its output hits the Windows cp1252 console codec.
-            child_env = dict(os.environ)
-            child_env["PYTHONUTF8"] = "1"
-            child_env["PYTHONIOENCODING"] = "utf-8"
-            try:
-                proc = subprocess.run(
-                    command,
-                    cwd=str(self.root),
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=timeout,
-                    env=child_env,
-                )
-                result = CheckResult(
-                    name=name,
-                    command=command,
-                    returncode=proc.returncode,
-                    stdout=proc.stdout,
-                    stderr=proc.stderr,
-                    duration_seconds=time.perf_counter() - start,
-                )
-            except subprocess.TimeoutExpired as exc:
-                result = CheckResult(
-                    name=name,
-                    command=command,
-                    returncode=124,
-                    stdout=subprocess_text(exc.stdout),
-                    stderr=subprocess_text(exc.stderr) + f"\nTimed out after {timeout}s",
-                    duration_seconds=time.perf_counter() - start,
-                )
-            results.append(result)
-        return results
+                    continue
+            to_run.append((idx, item))
+
+        # Checks are independent subprocesses (IO-bound) — run them concurrently
+        # and reassemble in config order so the report stays deterministic.
+        if to_run:
+            n_workers = min(len(to_run), max(1, os.cpu_count() or 4))
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = {
+                    pool.submit(self._run_one, item, changed_files, impacted_tests, timeout): idx
+                    for idx, item in to_run
+                }
+                for future in as_completed(futures):
+                    slots[futures[future]] = future.result()
+
+        if use_cache:
+            for idx, item in to_run:
+                result = slots[idx]
+                if result is None or result.returncode == 124:
+                    continue  # don't cache timeouts
+                cache[cache_key(item)] = {
+                    "command": result.command,
+                    "returncode": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "ts": now,
+                }
+            self._save_cache(cache)
+
+        cached_hits = len(pending) - len(to_run)
+        if use_cache and cached_hits:
+            print(f"[checks] {cached_hits} check(s) served from cache (no source change).")
+        return [r for r in slots if r is not None]
+
+    def _run_one(
+        self,
+        item: dict[str, Any],
+        changed_files: list[pathlib.Path],
+        impacted_tests: list[str],
+        timeout: int,
+    ) -> CheckResult:
+        name = item["name"]
+        command = self._render_command(name, item["command"], changed_files, impacted_tests)
+        command = self._append_tool_excludes(name, command)
+        command = self._append_basedpyright_switches(name, command)
+        if self._should_skip_optional_check(item, command):
+            return CheckResult(
+                name=name,
+                command=command,
+                returncode=0,
+                stdout=f"Skipped optional check '{name}' (dependency not available).",
+                stderr="",
+                duration_seconds=0.0,
+            )
+        start = time.perf_counter()
+        # Force UTF-8 in child processes — semgrep crashes with UnicodeEncodeError
+        # when its output hits the Windows cp1252 console codec.
+        child_env = dict(os.environ)
+        child_env["PYTHONUTF8"] = "1"
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=str(self.root),
+                shell=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                env=child_env,
+            )
+            return CheckResult(
+                name=name,
+                command=command,
+                returncode=proc.returncode,
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+                duration_seconds=time.perf_counter() - start,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return CheckResult(
+                name=name,
+                command=command,
+                returncode=124,
+                stdout=subprocess_text(exc.stdout),
+                stderr=subprocess_text(exc.stderr) + f"\nTimed out after {timeout}s",
+                duration_seconds=time.perf_counter() - start,
+            )
 
     def _render_command(
         self,
