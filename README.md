@@ -78,6 +78,37 @@ visionguard scan --new-only
 Every report header shows **new** vs **known** bug counts. Issue identity is
 line-number-independent, so a known bug stays matched as surrounding code shifts.
 
+### Runtime crash capture
+
+Run a script under VisionGuard — on an uncaught crash it records the traceback
+plus the **shape, dtype and device of every array/tensor** live in the failing
+frames, then writes a normal numbered report:
+
+```bash
+visionguard run train.py --epochs 10
+```
+
+### CI gate & pre-commit hook
+
+```bash
+# Exit non-zero if any issue at/above a severity is found — use in CI
+visionguard scan --fail-on high
+
+# Also emit a machine-readable report (feeds GitHub code scanning)
+visionguard scan --format sarif
+visionguard scan --format json
+
+# Install a git pre-commit hook that blocks new high-severity bugs
+visionguard hook
+visionguard hook --remove
+```
+
+The pre-commit hook runs `scan --staged --new-only --fail-on high` on every
+commit. Override a block with `git commit --no-verify`.
+
+Scan results are cached on a project fingerprint — a rescan with no source
+change is near-instant.
+
 ---
 
 ## Remove / Uninstall
@@ -130,6 +161,9 @@ visionguard clean --yes && pip uninstall visionguard -y
 | `.to("cuda")` / `.cuda()` hardcoded | Crashes on machines without GPU |
 | `threading.Thread` without `daemon=True` | Blocks clean program exit |
 | `cv2.imwrite()` return discarded | Silent write failure on bad path / disk full |
+| `cv2.VideoCapture` never released | Camera/file handle leaks — later opens fail |
+| RealSense pipeline started, never stopped | Device stays locked — re-run can't acquire it |
+| Discarded tensor transform (`.to()`/`.cuda()`/`.cpu()`/`.half()`/`.detach()`) | Not in-place — result silently lost |
 
 ### Runtime Error Parsing (from test output)
 
