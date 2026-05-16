@@ -26,7 +26,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, NoReturn
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -155,7 +155,59 @@ def load_config(path: pathlib.Path) -> dict[str, Any]:
                 "Install pyyaml or keep agent.yml in JSON syntax."
             ) from exc
         cfg = yaml.safe_load(raw) or {}
-    return merge_defaults(DEFAULT_CONFIG, cfg)
+    if not isinstance(cfg, dict):
+        raise ConfigError(f"{path.name} must contain a mapping at the top level.")
+    merged = merge_defaults(DEFAULT_CONFIG, cfg)
+    validate_config(merged, path.name)
+    return merged
+
+
+class ConfigError(ValueError):
+    """Raised when agent.yml has invalid structure or values."""
+
+
+def validate_config(cfg: dict[str, Any], source: str = "agent.yml") -> None:
+    """Fail fast with a clear message on a malformed config."""
+
+    def fail(msg: str) -> NoReturn:
+        raise ConfigError(f"{source}: {msg}")
+
+    mode = cfg.get("mode")
+    if mode not in ("safe_pr", "guarded_auto_apply"):
+        fail(f"'mode' must be 'safe_pr' or 'guarded_auto_apply', got {mode!r}.")
+
+    checks = cfg.get("checks")
+    if not isinstance(checks, dict):
+        fail("'checks' must be a mapping.")
+    commands = checks.get("commands")
+    if not isinstance(commands, list) or not commands:
+        fail("'checks.commands' must be a non-empty list.")
+    seen_names: set[str] = set()
+    for i, item in enumerate(commands):
+        if not isinstance(item, dict):
+            fail(f"'checks.commands[{i}]' must be a mapping.")
+        name = item.get("name")
+        command = item.get("command")
+        if not isinstance(name, str) or not name:
+            fail(f"'checks.commands[{i}]' needs a non-empty string 'name'.")
+        if not isinstance(command, str) or not command:
+            fail(f"check '{name}' needs a non-empty string 'command'.")
+        if name in seen_names:
+            fail(f"duplicate check name '{name}'.")
+        seen_names.add(name)
+
+    timeout = checks.get("timeout_seconds", 120)
+    if not isinstance(timeout, int) or timeout <= 0:
+        fail(f"'checks.timeout_seconds' must be a positive integer, got {timeout!r}.")
+    limit = checks.get("verify_fixes_limit", 5)
+    if not isinstance(limit, int) or limit < 0:
+        fail(f"'checks.verify_fixes_limit' must be a non-negative integer, got {limit!r}.")
+
+    for dotted in ("notifications.min_confidence", "auto_apply.min_confidence"):
+        section, key = dotted.split(".")
+        value = cfg.get(section, {}).get(key)
+        if value is not None and not (isinstance(value, (int, float)) and 0.0 <= value <= 1.0):
+            fail(f"'{dotted}' must be a number between 0 and 1, got {value!r}.")
 
 
 def merge_defaults(defaults: Any, override: Any) -> Any:
@@ -1521,6 +1573,40 @@ def severity_rank(severity: str) -> int:
     return ranks.get(severity, 99)
 
 
+def build_sarif(issues: list[Issue]) -> dict[str, Any]:
+    """Render issues as a SARIF 2.1.0 document for GitHub code scanning."""
+    sarif_level = {"critical": "error", "high": "error", "medium": "warning", "low": "note"}
+    results: list[dict[str, Any]] = []
+    for issue in issues:
+        result: dict[str, Any] = {
+            "ruleId": f"visionguard/{issue.source_check}",
+            "level": sarif_level.get(issue.severity, "warning"),
+            "message": {"text": f"{issue.title}: {issue.description}"},
+            "properties": {"confidence": issue.confidence, "severity": issue.severity},
+        }
+        if issue.file_path:
+            region = {"startLine": issue.line} if issue.line else {}
+            result["locations"] = [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": issue.file_path.replace("\\", "/")},
+                    **({"region": region} if region else {}),
+                }
+            }]
+        results.append(result)
+    return {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "VisionGuard",
+                "informationUri": "https://github.com/Rohit11-OG/VisionGuard",
+                "rules": [],
+            }},
+            "results": results,
+        }],
+    }
+
+
 def trim_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -2747,6 +2833,21 @@ class ReportWriter:
                 max_n = max(max_n, int(m.group(1)))
         return max_n + 1
 
+    def write_machine(self, md_report: pathlib.Path, issues: list[Issue], fmt: str) -> pathlib.Path:
+        """Write a machine-readable report (json or sarif) next to the markdown one."""
+        out = md_report.with_suffix(f".{fmt}")
+        if fmt == "sarif":
+            out.write_text(json.dumps(build_sarif(issues), indent=2), encoding="utf-8")
+        else:
+            payload = {
+                "schema": "visionguard/1",
+                "generated": utc_ts(),
+                "issue_count": len(issues),
+                "issues": [dataclasses.asdict(i) for i in issues],
+            }
+            out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return out
+
     def write(
         self,
         check_results: list[CheckResult],
@@ -2987,6 +3088,7 @@ class BodyguardAgent:
         self.baseline = BaselineStore(root)
         self.notifier = Notifier(root, self.cfg)
         self.telemetry = Telemetry(root, self.cfg)
+        self.last_exit_code = 0
 
     def init_workspace(self) -> None:
         ensure_dir(self.root / ".agent" / "index")
@@ -3001,6 +3103,8 @@ class BodyguardAgent:
         changed_paths: list[pathlib.Path] | None = None,
         update_baseline: bool = False,
         new_only: bool = False,
+        fail_on: str = "never",
+        report_format: str = "md",
     ) -> pathlib.Path:
         changed_paths = changed_paths or []
         t_start = time.perf_counter()
@@ -3062,6 +3166,9 @@ class BodyguardAgent:
             check_results, issues, proposals, changed_paths, static_issues,
             new_count=len(new_issues), known_count=known_count,
         )
+        if report_format in ("json", "sarif"):
+            machine = self.reporter.write_machine(report, issues, report_format)
+            print(f"[scan] {report_format.upper()} report — {machine.name}")
         self.notifier.publish(issues, proposals, report)
         self.telemetry.emit(
             "scan_summary",
@@ -3078,6 +3185,16 @@ class BodyguardAgent:
             f"{len(issues)} bug(s) found{new_note}, {len(static_issues)} static, "
             f"{ready}/{len(proposals)} patch(es) ready — {report.name}"
         )
+
+        self.last_exit_code = 0
+        if fail_on != "never":
+            threshold = severity_rank(fail_on)
+            blocking = [i for i in issues if severity_rank(i.severity) <= threshold]
+            if blocking:
+                self.last_exit_code = 1
+                print(f"[scan] FAIL — {len(blocking)} issue(s) at or above '{fail_on}' severity.")
+            else:
+                print(f"[scan] PASS — no issue at or above '{fail_on}' severity.")
         return report
 
     def _verify_proposals(self, proposals: list[PatchProposal], issues: list[Issue]) -> None:
@@ -3581,6 +3698,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--new-only", action="store_true",
         help="Report only issues absent from the baseline",
     )
+    scan.add_argument(
+        "--fail-on", choices=["critical", "high", "medium", "low", "never"], default="never",
+        help="Exit non-zero if any issue at or above this severity is found (CI gate)",
+    )
+    scan.add_argument(
+        "--format", dest="report_format", choices=["md", "json", "sarif"], default="md",
+        help="Also emit a machine-readable report (json or sarif) beside the markdown one",
+    )
 
     sub.add_parser("watch", help="Watch for file changes and auto-scan on every save")
 
@@ -3633,7 +3758,11 @@ def main(argv: list[str] | None = None) -> int:
         bootstrap_agent = BodyguardAgent(root, config_path)
         bootstrap_agent.init_workspace()
 
-    agent = BodyguardAgent(root, config_path)
+    try:
+        agent = BodyguardAgent(root, config_path)
+    except ConfigError as exc:
+        print(f"[config error] {exc}")
+        return 2
 
     try:
         if args.command == "scan":
@@ -3655,7 +3784,14 @@ def main(argv: list[str] | None = None) -> int:
                     return 0
             else:
                 changed = [root / p for p in args.paths] if args.paths else None
-            agent.scan(changed, update_baseline=args.update_baseline, new_only=args.new_only)
+            agent.scan(
+                changed,
+                update_baseline=args.update_baseline,
+                new_only=args.new_only,
+                fail_on=args.fail_on,
+                report_format=args.report_format,
+            )
+            return agent.last_exit_code
         elif args.command == "watch":
             agent.watch()
         elif args.command == "report":
