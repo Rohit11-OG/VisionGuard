@@ -1,219 +1,256 @@
-# VisionGuard
+<!-- ════════════════════════════════════════════════════════════════ -->
+<!--                        V I S I O N G U A R D                      -->
+<!-- ════════════════════════════════════════════════════════════════ -->
 
-Deep static + runtime bug detection agent for Python computer vision projects.
+<div align="center">
 
-Tuned for **YOLO**, **Intel RealSense**, **MegaPose**, **OpenCV**, **PyTorch**, and **PyQt5**.
+<a href="https://github.com/Rohit11-OG/VisionGuard">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:8E2DE2,50:4A00E0,100:00C9FF&height=260&section=header&text=VisionGuard&fontSize=82&fontColor=ffffff&animation=fadeIn&fontAlignY=38&desc=Deep%20static%20%2B%20runtime%20bug%20detection%20for%20Computer%20Vision&descSize=18&descAlignY=60" alt="VisionGuard" />
+</a>
 
----
+<br/>
 
-## Install
+<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=24&pause=900&color=00C9FF&center=true&vCenter=true&width=820&lines=Catches+the+CV+bug+before+the+camera+does.;cv2.imread()+returned+None%3F+Caught.;CUDA+weights+on+a+CPU+box%3F+Caught.;Tensor+shape+mismatch%3F+Caught+with+shapes.;Scan+%E2%86%92+Detect+%E2%86%92+Fix+%E2%86%92+Verify+%E2%86%92+Report." alt="Typing banner" />
 
-### One command — works from any terminal inside your project folder
+<br/><br/>
 
-**Windows (PowerShell):**
+<!-- ░░░ BADGES ░░░ -->
+<img src="https://img.shields.io/badge/python-3.9%20%E2%86%92%203.12-3776AB?style=for-the-badge&logo=python&logoColor=white" />
+<img src="https://img.shields.io/badge/zero-dependencies-00C9FF?style=for-the-badge" />
+<img src="https://img.shields.io/badge/license-MIT-8E2DE2?style=for-the-badge" />
+<img src="https://img.shields.io/badge/tests-31%20passing-4A00E0?style=for-the-badge&logo=pytest&logoColor=white" />
+
+<br/>
+
+<img src="https://img.shields.io/badge/YOLO-purple?style=flat-square&logo=yolo&logoColor=white" />
+<img src="https://img.shields.io/badge/Intel%20RealSense-0071C5?style=flat-square&logo=intel&logoColor=white" />
+<img src="https://img.shields.io/badge/PyTorch-EE4C2C?style=flat-square&logo=pytorch&logoColor=white" />
+<img src="https://img.shields.io/badge/OpenCV-5C3EE8?style=flat-square&logo=opencv&logoColor=white" />
+<img src="https://img.shields.io/badge/PyQt5-41CD52?style=flat-square&logo=qt&logoColor=white" />
+<img src="https://img.shields.io/badge/MegaPose-FF6F00?style=flat-square" />
+
+</div>
+
+<!-- ░░░ NEON DIVIDER ░░░ -->
+<img src="https://capsule-render.vercel.app/api?type=rect&color=0:8E2DE2,50:4A00E0,100:00C9FF&height=3" width="100%" />
+
+```text
+        ╔═══════════════════════════════════════════════════════════╗
+        ║   ░▒▓  S C A N  →  D E T E C T  →  F I X  →  R E P O R T  ▓▒░ ║
+        ╚═══════════════════════════════════════════════════════════╝
+              \                                             /
+               \         ┌───────────────────────┐         /
+                ●────────┤   visionguard scan     ├────────●
+                         └───────────┬───────────┘
+                          ▼          ▼          ▼
+                    [AST checks]  [runtime]  [lint/type]
+                          \          |          /
+                           ●─────────●─────────●
+                                     ▼
+                            ╔════════════════╗
+                            ║   report.md    ║
+                            ╚════════════════╝
+```
+
+<div align="center">
+
+### ⚡ The pipeline
+
+</div>
+
+```mermaid
+flowchart LR
+    A([Your CV code]) -->|scan| B{VisionGuard}
+    B --> C[AST static checks]
+    B --> D[Check runners<br/>compileall · ruff · pyright · semgrep]
+    B --> E[Runtime trace<br/>tensor shapes at crash]
+    C --> F[(Issues)]
+    D --> F
+    E --> F
+    F --> G[Fix planner]
+    G -->|apply in sandbox| H{Re-run check}
+    H -->|passes| I[[Verified patch]]
+    H -->|fails| J[Discarded]
+    F --> K[[report.md / .sarif / .json]]
+    style B fill:#4A00E0,stroke:#00C9FF,color:#fff
+    style K fill:#8E2DE2,stroke:#00C9FF,color:#fff
+    style I fill:#00C9FF,stroke:#4A00E0,color:#000
+```
+
+<img src="https://capsule-render.vercel.app/api?type=rect&color=0:00C9FF,100:8E2DE2&height=3" width="100%" />
+
+## 🚀 Install
+
+<table>
+<tr>
+<td width="50%">
+
+**Windows · PowerShell**
 ```powershell
 irm https://raw.githubusercontent.com/Rohit11-OG/VisionGuard/main/install.ps1 | iex
 ```
 
-**Linux / macOS:**
+</td>
+<td width="50%">
+
+**Linux / macOS**
 ```bash
 curl -sSL https://raw.githubusercontent.com/Rohit11-OG/VisionGuard/main/install.sh | bash
 ```
 
-**Or install manually with pip:**
+</td>
+</tr>
+</table>
+
+**Or with pip:**
 ```bash
 pip install "git+https://github.com/Rohit11-OG/VisionGuard.git[full]"
 ```
 
-> `[full]` adds optional extras: `watchfiles`, `ruff`, `libcst`, `opentelemetry`.  
-> Drop `[full]` for a minimal install — core scanning works on stdlib only.
+> `[full]` adds optional extras — `watchfiles`, `ruff`, `libcst`, `opentelemetry`.
+> Drop it for a minimal install: **core scanning runs on the stdlib alone.**
 
----
+<img src="https://capsule-render.vercel.app/api?type=rect&color=0:8E2DE2,100:00C9FF&height=3" width="100%" />
 
-## Usage
-
-Run every command from inside your CV project directory.
+## 🎮 Usage
 
 ```bash
-# Step 1 — one-time setup (creates agent.yml + .vscode tasks)
-visionguard bootstrap
-
-# Step 2 — scan now
-visionguard scan
-
-# Step 3 — watch mode: auto-scans on every file save
-visionguard watch
-
-# List recent reports
-visionguard report --latest 5
+visionguard bootstrap          # one-time setup — agent.yml + VS Code tasks
+visionguard scan               # scan now
+visionguard watch              # auto-scan on every file save
+visionguard report --latest 5  # list recent reports
 ```
 
-Reports are written to `.agent/reports/report_1.md`, `report_2.md`, ... — each scan makes a new numbered report.
+Each scan writes a single rolling **`.agent/reports/report.md`** (set
+`reporting.rolling: false` for a numbered history).
 
-### Scoped scans
-
-Limit a scan to the files you actually touched — faster, less noise:
+<details>
+<summary><b>🎯 Scoped scans — faster, less noise</b></summary>
 
 ```bash
-# Only .py files changed vs a git ref
-visionguard scan --since main
+visionguard scan --since main      # only .py files changed vs a git ref
 visionguard scan --since HEAD~1
-
-# Only git-staged files — ideal for a pre-commit hook
-visionguard scan --staged
+visionguard scan --staged          # only git-staged files
 ```
 
-### Baseline — show only new bugs
+</details>
 
-Record the current findings as accepted, then future scans surface only what's new:
+<details>
+<summary><b>📊 Baseline — show only NEW bugs</b></summary>
 
 ```bash
-# Accept all current issues into .agent/baseline.json
-visionguard scan --update-baseline
-
-# Report only issues absent from the baseline
-visionguard scan --new-only
+visionguard scan --update-baseline # accept current issues
+visionguard scan --new-only        # report only what's new
 ```
 
-Every report header shows **new** vs **known** bug counts. Issue identity is
-line-number-independent, so a known bug stays matched as surrounding code shifts.
+Report headers show **new** vs **known** counts. Issue identity is
+line-number-independent — a known bug stays matched as code shifts.
 
-### Runtime crash capture
+</details>
 
-Run a script under VisionGuard — on an uncaught crash it records the traceback
-plus the **shape, dtype and device of every array/tensor** live in the failing
-frames, then writes a normal numbered report:
+<details>
+<summary><b>💥 Runtime crash capture — with tensor shapes</b></summary>
 
 ```bash
 visionguard run train.py --epochs 10
 ```
 
-### CI gate & pre-commit hook
+On an uncaught crash, records the traceback **plus the shape, dtype and
+device of every array/tensor** live in the failing frames.
+
+</details>
+
+<details>
+<summary><b>🛡️ CI gate & pre-commit hook</b></summary>
 
 ```bash
-# Exit non-zero if any issue at/above a severity is found — use in CI
-visionguard scan --fail-on high
-
-# Also emit a machine-readable report (feeds GitHub code scanning)
-visionguard scan --format sarif
+visionguard scan --fail-on high    # exit non-zero — drop into CI
+visionguard scan --format sarif    # GitHub code-scanning
 visionguard scan --format json
-
-# Install a git pre-commit hook that blocks new high-severity bugs
-visionguard hook
+visionguard hook                   # install git pre-commit hook
 visionguard hook --remove
 ```
 
-The pre-commit hook runs `scan --staged --new-only --fail-on high` on every
-commit. Override a block with `git commit --no-verify`.
+The hook runs `scan --staged --new-only --fail-on high` on every commit.
+Override with `git commit --no-verify`.
 
-Scan results are cached on a project fingerprint — a rescan with no source
-change is near-instant.
+</details>
 
----
+<img src="https://capsule-render.vercel.app/api?type=rect&color=0:00C9FF,100:4A00E0&height=3" width="100%" />
 
-## Remove / Uninstall
+## 🔍 What It Detects
 
-### Remove agent files from a project
+<div align="center">
 
-Deletes `.agent/`, `agent.yml`, and the VS Code task files VisionGuard created.  
-Your actual source code is never touched.
+### 🧠 CV Static Analysis — pure AST, no test run needed
 
-```bash
-# Interactive — asks for confirmation
-visionguard clean
+</div>
 
-# Skip confirmation prompt
-visionguard clean --yes
-```
-
-### Also remove the CLI tool from your system
-
-```bash
-pip uninstall visionguard -y
-```
-
-### Full removal (project files + CLI)
-
-```bash
-visionguard clean --yes && pip uninstall visionguard -y
-```
-
----
-
-## What It Detects
-
-### CV Static Analysis — no test run needed (AST)
-
-| Bug | Example crash |
+| 🐞 Bug | 💀 Crash it prevents |
 |---|---|
 | `cv2.imread` without `None` check | Returns `None` on bad path → next line crashes |
-| `.numpy()` without `.detach()/.cpu()` | Fails on GPU or grad tensor |
-| `plt.imshow` on BGR image | Colors inverted — cv2=BGR, plt=RGB |
-| `cv2.resize` dsize wrong order | `.shape[:2]` is `(H,W)` but dsize needs `(W,H)` |
+| `.numpy()` without `.detach()/.cpu()` | Fails on a GPU or grad tensor |
+| `plt.imshow` on a BGR image | Colors inverted — cv2 is BGR, plt is RGB |
+| `cv2.resize` dsize order | `.shape[:2]` is `(H,W)` but dsize needs `(W,H)` |
 | `wait_for_frames()` without `timeout_ms` | Hangs forever on camera disconnect |
-| RealSense frame without `.is_valid()` | `get_data()` on invalid frame crashes |
+| RealSense frame without `.is_valid()` | `get_data()` on an invalid frame crashes |
 | `results.masks.xy` without None check | YOLO returns `None` when nothing detected |
-| Division by depth variable | RealSense returns `0` for invalid pixels |
-| `queue.get(timeout=...)` without `Empty` handler | Silent thread crash on timeout |
+| Division by a depth variable | RealSense returns `0` for invalid pixels |
+| `queue.get(timeout=…)` without `Empty` handler | Silent thread crash on timeout |
 | `self._frame` outside `with self._lock:` | Race condition in camera threads |
-| `cv2.VideoCapture` without `isOpened()` | Silent fail on wrong camera index |
-| `torch.load()` without `map_location` | Crashes loading CUDA weights on CPU-only machine |
-| `.to("cuda")` / `.cuda()` hardcoded | Crashes on machines without GPU |
-| `threading.Thread` without `daemon=True` | Blocks clean program exit |
-| `cv2.imwrite()` return discarded | Silent write failure on bad path / disk full |
+| `cv2.VideoCapture` without `isOpened()` | Silent fail on a wrong camera index |
 | `cv2.VideoCapture` never released | Camera/file handle leaks — later opens fail |
 | RealSense pipeline started, never stopped | Device stays locked — re-run can't acquire it |
-| Discarded tensor transform (`.to()`/`.cuda()`/`.cpu()`/`.half()`/`.detach()`) | Not in-place — result silently lost |
+| `torch.load()` without `map_location` | Crashes loading CUDA weights on a CPU-only box |
+| `.to("cuda")` / `.cuda()` hardcoded | Crashes on machines without a GPU |
+| Discarded tensor transform (`.to`/`.cuda`/`.cpu`/`.half`/`.detach`) | Not in-place — result silently lost |
+| `threading.Thread` without `daemon=True` | Blocks clean program exit |
+| `cv2.imwrite()` return discarded | Silent write failure on bad path / full disk |
 
-### Runtime Error Parsing (from test output)
+<div align="center">
 
-- `SyntaxError`, `NameError`, `AttributeError`, `TypeError`, `ImportError`
-- `ValueError`, `IndexError`, `KeyError`, `ZeroDivisionError`
-- `FileNotFoundError` — missing model/weight files
-- `RecursionError`, `MemoryError`
-- Tensor shape/broadcast mismatches
-- CUDA OOM, device mismatch, dtype mismatch, `torch.load` device error
-- `cv2.error`, PIL image errors
-- RealSense frame timeout, pipeline/device errors
-- YOLO/ultralytics model errors
-- Threading errors (cross-thread CUDA, event loop)
+### ⚙️ Runtime Error Parsing &nbsp;·&nbsp; 🧵 Full Call-Chain Tracebacks
 
-### Full Call Chain Tracebacks
+</div>
 
-Captures every user-code frame — not just the crash point.  
-Skips `site-packages`, `venv`, stdlib frames automatically.
+`SyntaxError` · `NameError` · `AttributeError` · `TypeError` · `ImportError` ·
+`ValueError` · `IndexError` · `KeyError` · `ZeroDivisionError` ·
+`FileNotFoundError` · `RecursionError` · `MemoryError` · tensor
+shape/broadcast mismatches · CUDA OOM / device / dtype errors ·
+`cv2.error` · PIL errors · RealSense timeout & pipeline errors ·
+YOLO/ultralytics errors · cross-thread CUDA & event-loop errors.
 
----
+> Every user-code frame is captured — `site-packages`, `venv` and stdlib
+> frames are skipped automatically, so a tool's own crash is never
+> mistaken for your bug.
 
-## Report Format
+<img src="https://capsule-render.vercel.app/api?type=rect&color=0:4A00E0,100:8E2DE2&height=3" width="100%" />
 
-Each scan writes a clean Markdown report:
+## 📰 Report Format
 
-```
-VisionGuard Report #3
+```text
+ ╔══════════════════════════════════════════════════════╗
+ ║              V I S I O N G U A R D   R E P O R T      ║
+ ╚══════════════════════════════════════════════════════╝
+  Checks: compileall PASS | ruff PASS | basedpyright FAIL
+  Total bugs: 6   New: 2   Known: 4   Patches ready: 1
 
-Checks: compileall PASS | ruff PASS | basedpyright FAIL
-Total bugs found: 6
-Auto-fix patches ready: 1
+  ▸ Bug #1 — [HIGH] RealSense frame used without is_valid()
+      realsense_camera.py:47
+      >>> 47 | color_frame = frames.get_color_frame()
+          48 | data = color_frame.get_data()   # crashes if invalid
 
-Bug #1 — [HIGH] RealSense frame used without is_valid() check
-  File: realsense_camera.py line 47
-  Fix:  Always call frame.is_valid() before frame.get_data()
-  Code:
-    >>> 47 | color_frame = frames.get_color_frame()
-        48 | data = color_frame.get_data()   # crashes if frame invalid
-
-Bug #2 — [HIGH] torch.load() missing map_location ...
-...
-
-Patch #1 — Add timeout_ms=5000 to wait_for_frames() (fixes Bug #4)
-  -    pipeline.wait_for_frames()
-  +    pipeline.wait_for_frames(timeout_ms=5000)
+  ▸ Patch #1 — add timeout_ms=5000 to wait_for_frames()  [Verified ✓]
+      -    pipeline.wait_for_frames()
+      +    pipeline.wait_for_frames(timeout_ms=5000)
 ```
 
----
+Patches are **sandbox-verified** — applied to a temp copy, the relevant
+check re-run, and kept only if it passes. Nothing is silently changed.
 
-## Checks Run
+<img src="https://capsule-render.vercel.app/api?type=rect&color=0:8E2DE2,100:00C9FF&height=3" width="100%" />
+
+## 🧰 Checks Run
 
 | Tool | Purpose | Required |
 |---|---|---|
@@ -222,68 +259,56 @@ Patch #1 — Add timeout_ms=5000 to wait_for_frames() (fixes Bug #4)
 | `unittest` | Test discovery | If tests exist |
 | `ruff` | Lint, unused vars, style | Optional |
 | `basedpyright` | Static type checking | Optional |
+| `semgrep` | Pattern-based security/bug rules | Optional |
 
----
+Checks run **in parallel** and results are **cached on a project
+fingerprint** — a rescan with no source change is near-instant.
 
-## Auto-Fix Proposals
+<img src="https://capsule-render.vercel.app/api?type=rect&color=0:00C9FF,100:8E2DE2&height=3" width="100%" />
 
-VisionGuard proposes (never silently applies) patches for:
+## ⚙️ Config — `agent.yml`
 
-- `torch.load(path)` → `torch.load(path, map_location='cpu')`
-- `pipeline.wait_for_frames()` → `pipeline.wait_for_frames(timeout_ms=5000)`
-- Missing block `:` (SyntaxError)
-- Missing CV imports: `cv2`, `torch`, `np`, `nn`, `F`, `transforms`, `Image`, `plt`, `DataLoader`, `tqdm`, `albumentations`, etc.
+Auto-created on first run.
 
-Patches written to `.agent/patches/` as `.patch` files. Enable auto-apply in `agent.yml`:
-
-```json
-{
-  "auto_apply": {
-    "enabled": true,
-    "min_confidence": 0.85
-  }
-}
-```
-
----
-
-## Config (`agent.yml`)
-
-Auto-created on first run. Key options:
-
-```json
+```jsonc
 {
   "mode": "safe_pr",
-  "watch": {
-    "ignore": ["datasets", "checkpoints", "weights", "runs", "models", "vendor"]
-  },
-  "auto_apply": {
-    "enabled": false,
-    "min_confidence": 0.85
-  }
+  "watch":     { "ignore": ["datasets", "checkpoints", "weights", "runs"] },
+  "checks":    { "cache_results": true, "verify_fixes": true },
+  "reporting": { "rolling": true },
+  "auto_apply":{ "enabled": false, "min_confidence": 0.85 }
 }
 ```
 
----
+<img src="https://capsule-render.vercel.app/api?type=rect&color=0:4A00E0,100:00C9FF&height=3" width="100%" />
 
-## VS Code Integration
+## 🧹 Remove
 
-`visionguard bootstrap` writes `.vscode/tasks.json` with:
-- **Bodyguard: Auto Start** — runs on folder open
-- **Bodyguard: Scan** — manual scan
-- **Bodyguard: Watch** — background watcher
+```bash
+visionguard clean              # delete .agent/, agent.yml, VS Code tasks
+visionguard clean --yes        # skip the prompt
+pip uninstall visionguard -y   # remove the CLI
+```
 
----
+Your source code is **never** touched.
 
-## Target Stack
+<img src="https://capsule-render.vercel.app/api?type=rect&color=0:00C9FF,100:8E2DE2&height=3" width="100%" />
 
-- `ultralytics` (YOLOv8 / v11)
-- `pyrealsense2` (Intel RealSense D4xx / L5xx)
-- `torch` / `torchvision`
-- `cv2` (OpenCV)
-- `numpy`
-- `PIL` / `Pillow`
-- `PyQt5`
-- `albumentations`
-- `scipy`
-- `threading` / `queue`
+## 🎯 Target Stack
+
+<div align="center">
+
+`ultralytics` · `pyrealsense2` · `torch` · `torchvision` · `cv2` ·
+`numpy` · `PIL` · `PyQt5` · `albumentations` · `scipy` · `threading` · `queue`
+
+</div>
+
+<br/>
+
+<div align="center">
+
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:00C9FF,50:4A00E0,100:8E2DE2&height=160&section=footer&text=Ship%20CV%20code%20that%20doesn't%20crash%20on%20the%20robot.&fontSize=20&fontColor=ffffff&animation=twinkling" alt="footer" />
+
+<sub>⭐ Star it if VisionGuard caught a bug for you · MIT Licensed</sub>
+
+</div>
