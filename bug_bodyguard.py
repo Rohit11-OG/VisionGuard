@@ -222,6 +222,63 @@ def collect_python_files(root: pathlib.Path, ignore_tokens: list[str]) -> list[p
     return sorted(files)
 
 
+def git_changed_files(root: pathlib.Path, ref: str) -> list[pathlib.Path] | None:
+    """Return added/modified/renamed .py files vs a git ref.
+
+    `ref` may be a normal ref (HEAD~1, main, ...) or the literal "STAGED"
+    to use the index. Returns None when git is unavailable or the ref is bad.
+    """
+    if ref == "STAGED":
+        cmd = ["git", "-C", str(root), "diff", "--name-only", "--cached", "--diff-filter=ACMR"]
+    else:
+        cmd = ["git", "-C", str(root), "diff", "--name-only", "--diff-filter=ACMR", ref]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
+    if proc.returncode != 0:
+        return None
+    files: list[pathlib.Path] = []
+    for line in proc.stdout.splitlines():
+        name = line.strip()
+        if not name.endswith(".py"):
+            continue
+        candidate = (root / name).resolve()
+        if candidate.exists():
+            files.append(candidate)
+    return files
+
+
+def issue_fingerprint(issue: "Issue") -> str:
+    """Stable identity for an issue across scans (line numbers may drift)."""
+    return short_hash(f"{issue.source_check}|{issue.title}|{issue.file_path}")
+
+
+class BaselineStore:
+    """Persists accepted-issue fingerprints so future scans can show only new bugs."""
+
+    def __init__(self, root: pathlib.Path) -> None:
+        self.path = root / ".agent" / "baseline.json"
+
+    def load(self) -> set[str]:
+        if not self.path.exists():
+            return set()
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            return set(data.get("fingerprints", []))
+        except (json.JSONDecodeError, OSError):
+            return set()
+
+    def save(self, issues: list["Issue"]) -> int:
+        ensure_dir(self.path.parent)
+        fps = sorted({issue_fingerprint(i) for i in issues})
+        self.path.write_text(
+            json.dumps({"updated": utc_ts(), "count": len(fps), "fingerprints": fps}, indent=2),
+            encoding="utf-8",
+        )
+        return len(fps)
+
+
 class RepoIndexer:
     def __init__(self, root: pathlib.Path, cfg: dict[str, Any]) -> None:
         self.root = root
@@ -2574,6 +2631,8 @@ class ReportWriter:
         proposals: list[PatchProposal],
         changed_files: list[pathlib.Path],
         static_issues: list[Issue] | None = None,
+        new_count: int | None = None,
+        known_count: int = 0,
     ) -> pathlib.Path:
         static_issues = static_issues or []
         ensure_dir(self.report_dir)
@@ -2608,6 +2667,9 @@ class ReportWriter:
         lines.append(f"**Files scanned:** {len(changed_files)} changed  ")
         lines.append(f"**Checks:** {scan_summary}  ")
         lines.append(f"**Total bugs found:** {len(all_bugs)}  ")
+        if new_count is not None:
+            lines.append(f"**New bugs (not in baseline):** {new_count}  ")
+            lines.append(f"**Known bugs (baseline):** {known_count}  ")
         lines.append(f"**Auto-fix patches ready:** {len(ready_patches)}  ")
         lines.append(f"**Auto-applied patches:** {len(auto_applied)}  ")
         lines.append("")
@@ -2799,6 +2861,7 @@ class BodyguardAgent:
         self.fix_planner = FixPlanner(root, self.cfg)
         self.validator = ValidationGate(root)
         self.reporter = ReportWriter(root, self.cfg)
+        self.baseline = BaselineStore(root)
         self.notifier = Notifier(root, self.cfg)
         self.telemetry = Telemetry(root, self.cfg)
 
@@ -2810,7 +2873,12 @@ class BodyguardAgent:
         py_count, symbols = self.indexer.rebuild()
         print(f"[init] Ready. indexed_python_files={py_count}, symbols_indexed={symbols}")
 
-    def scan(self, changed_paths: list[pathlib.Path] | None = None) -> pathlib.Path:
+    def scan(
+        self,
+        changed_paths: list[pathlib.Path] | None = None,
+        update_baseline: bool = False,
+        new_only: bool = False,
+    ) -> pathlib.Path:
         changed_paths = changed_paths or []
         t_start = time.perf_counter()
 
@@ -2832,7 +2900,28 @@ class BodyguardAgent:
             print(f"[scan] Static CV analysis (cache-aware, parallel)...")
             with self.telemetry.span("cv_static_analysis"):
                 static_issues = self.cv_analyzer.analyze()
+                if changed_paths:
+                    # Diff-scoped scan: keep only CV findings in the changed files.
+                    changed_set = {p.resolve() for p in changed_paths}
+                    static_issues = [
+                        i for i in static_issues
+                        if i.file_path and (self.root / i.file_path).resolve() in changed_set
+                    ]
                 issues = _merge_issues(issues, static_issues)
+
+            # ── Baseline: separate new issues from previously-accepted ones ──
+            baseline_fps = self.baseline.load()
+            new_issues = [i for i in issues if issue_fingerprint(i) not in baseline_fps]
+            known_count = len(issues) - len(new_issues)
+            if update_baseline:
+                saved = self.baseline.save(issues)
+                print(f"[scan] Baseline updated — {saved} issue fingerprint(s) recorded.")
+                baseline_fps = self.baseline.load()
+                new_issues = []
+                known_count = len(issues)
+            if new_only and baseline_fps:
+                issues = new_issues
+                static_issues = [i for i in static_issues if issue_fingerprint(i) not in baseline_fps]
 
             with self.telemetry.span("fix_planning"):
                 heuristic_proposals = [self.validator.validate(p) for p in self.fix_planner.build_proposals(issues)]
@@ -2844,7 +2933,10 @@ class BodyguardAgent:
             check_results, issues, proposals = self._maybe_auto_apply_guarded(check_results, issues, proposals)
 
         elapsed = time.perf_counter() - t_start
-        report = self.reporter.write(check_results, issues, proposals, changed_paths, static_issues)
+        report = self.reporter.write(
+            check_results, issues, proposals, changed_paths, static_issues,
+            new_count=len(new_issues), known_count=known_count,
+        )
         self.notifier.publish(issues, proposals, report)
         self.telemetry.emit(
             "scan_summary",
@@ -2855,9 +2947,10 @@ class BodyguardAgent:
             report=report.as_posix(),
         )
         ready = sum(1 for p in proposals if p.validated)
+        new_note = f", {len(new_issues)} new" if baseline_fps else ""
         print(
             f"[scan] Done in {elapsed:.1f}s — "
-            f"{len(issues)} bug(s) found, {len(static_issues)} static, "
+            f"{len(issues)} bug(s) found{new_note}, {len(static_issues)} static, "
             f"{ready}/{len(proposals)} patch(es) ready — {report.name}"
         )
         return report
@@ -3293,6 +3386,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     scan = sub.add_parser("scan", help="Run all checks and generate a numbered bug report")
     scan.add_argument("paths", nargs="*", help="Optional: specific files to mark as changed")
+    scan.add_argument("--since", metavar="REF", help="Scan only .py files changed vs this git ref (e.g. HEAD~1, main)")
+    scan.add_argument("--staged", action="store_true", help="Scan only git-staged .py files")
+    scan.add_argument(
+        "--update-baseline", action="store_true",
+        help="Record all current issues into .agent/baseline.json as accepted",
+    )
+    scan.add_argument(
+        "--new-only", action="store_true",
+        help="Report only issues absent from the baseline",
+    )
 
     sub.add_parser("watch", help="Watch for file changes and auto-scan on every save")
 
@@ -3349,8 +3452,25 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "scan":
-            changed = [root / p for p in args.paths]
-            agent.scan(changed if args.paths else None)
+            if args.staged:
+                changed = git_changed_files(root, "STAGED")
+                if changed is None:
+                    print("[scan] git unavailable or not a repo — cannot use --staged.")
+                    return 1
+                if not changed:
+                    print("[scan] No staged .py files to scan.")
+                    return 0
+            elif args.since:
+                changed = git_changed_files(root, args.since)
+                if changed is None:
+                    print(f"[scan] git diff failed for ref '{args.since}'.")
+                    return 1
+                if not changed:
+                    print(f"[scan] No .py files changed vs '{args.since}'.")
+                    return 0
+            else:
+                changed = [root / p for p in args.paths] if args.paths else None
+            agent.scan(changed, update_baseline=args.update_baseline, new_only=args.new_only)
         elif args.command == "watch":
             agent.watch()
         elif args.command == "report":
