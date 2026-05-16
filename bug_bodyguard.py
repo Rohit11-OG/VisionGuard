@@ -16,7 +16,9 @@ import json
 import os
 import pathlib
 import queue
+import faulthandler
 import re
+import runpy
 import shlex
 import shutil
 import subprocess
@@ -3333,6 +3335,17 @@ class BodyguardAgent:
                 print(f"[scan] PASS — no issue at or above '{fail_on}' severity.")
         return report
 
+    def runtime_scan(self, crash_text: str) -> pathlib.Path:
+        """Turn a captured runtime crash into a normal numbered report."""
+        crash = CheckResult(
+            name="runtime", command="visionguard run", returncode=1,
+            stdout=crash_text, stderr="", duration_seconds=0.0,
+        )
+        issues = self.detector.detect([crash])
+        report = self.reporter.write([crash], issues, [], [], [])
+        self.notifier.publish(issues, [], report)
+        return report
+
     def _verify_proposals(self, proposals: list[PatchProposal], issues: list[Issue]) -> None:
         """Sandbox-verify each patch: apply it, rerun the relevant check, then revert.
 
@@ -3741,6 +3754,83 @@ def install_git_hook(root: pathlib.Path, remove: bool = False) -> int:
     return 0
 
 
+def _format_crash_shapes(tb: Any) -> str:
+    """Walk the traceback's frames and record array/tensor shapes of locals.
+
+    This is the 'runtime' half of VisionGuard — a CV crash is far easier to
+    diagnose when you can see the tensor shapes/dtypes/devices at the failure.
+    """
+    lines: list[str] = []
+    seen: set[str] = set()
+    node = tb
+    while node is not None:
+        frame = node.tb_frame
+        fname = pathlib.Path(frame.f_code.co_filename).name
+        for var, val in list(frame.f_locals.items()):
+            shape = getattr(val, "shape", None)
+            if shape is None:
+                continue
+            # Only real arrays/tensors — reject e.g. the numpy module's
+            # `shape` function by requiring a tuple of ints.
+            try:
+                shape_s = tuple(int(x) for x in shape)
+            except (TypeError, ValueError):
+                continue
+            key = f"{fname}:{var}"
+            if key in seen:
+                continue
+            seen.add(key)
+            dtype = getattr(val, "dtype", "")
+            device = getattr(val, "device", "")
+            extra = f" device={device}" if device else ""
+            lines.append(
+                f"  {var}: shape={shape_s} dtype={dtype}{extra}"
+                f"  ({fname}:{node.tb_lineno} in {frame.f_code.co_name})"
+            )
+        node = node.tb_next
+    return "\n".join(lines)
+
+
+def runtime_trace(agent: "BodyguardAgent", script: str, script_args: list[str]) -> int:
+    """Run a Python script; on an uncaught crash, capture it into a report."""
+    script_path = pathlib.Path(script).resolve()
+    if not script_path.exists():
+        print(f"[run] script not found: {script}")
+        return 1
+
+    faulthandler.enable()
+    old_argv = sys.argv
+    sys.argv = [str(script_path), *script_args]
+    crash_text = ""
+    try:
+        runpy.run_path(str(script_path), run_name="__main__")
+    except SystemExit:
+        pass
+    except BaseException as exc:  # noqa: BLE001 — we re-surface it as a report
+        # Drop VisionGuard's own runpy launch frames so the report points
+        # only at the user's code.
+        tb = exc.__traceback__
+        while tb is not None:
+            fn = tb.tb_frame.f_code.co_filename
+            if fn != __file__ and "runpy" not in fn:
+                break
+            tb = tb.tb_next
+        crash_text = "".join(traceback.format_exception(type(exc), exc, tb))
+        shapes = _format_crash_shapes(tb)
+        if shapes:
+            crash_text += "\n[VisionGuard] array/tensor shapes at crash:\n" + shapes
+    finally:
+        sys.argv = old_argv
+
+    if not crash_text:
+        print("[run] script completed — no uncaught exception.")
+        return 0
+    print(crash_text)
+    report = agent.runtime_scan(crash_text)
+    print(f"[run] crash captured — {report.name}")
+    return 1
+
+
 def install_optional_dependencies() -> None:
     packages = [
         "watchfiles",
@@ -3891,6 +3981,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     sub.add_parser("watch", help="Watch for file changes and auto-scan on every save")
 
+    run = sub.add_parser("run", help="Run a Python script; capture any runtime crash into a report")
+    run.add_argument("script", help="Python script to execute")
+    run.add_argument("script_args", nargs=argparse.REMAINDER, help="Arguments passed to the script")
+
     hook = sub.add_parser("hook", help="Install a git pre-commit hook that blocks new high-severity bugs")
     hook.add_argument("--remove", action="store_true", help="Remove the VisionGuard pre-commit hook")
 
@@ -3982,6 +4076,8 @@ def main(argv: list[str] | None = None) -> int:
             return agent.last_exit_code
         elif args.command == "watch":
             agent.watch()
+        elif args.command == "run":
+            return runtime_trace(agent, args.script, list(args.script_args or []))
         elif args.command == "report":
             reports = agent.list_reports(limit=args.latest)
             if not reports:
