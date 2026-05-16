@@ -3559,6 +3559,52 @@ def write_vscode_autostart_files(root: pathlib.Path, script_name: str) -> None:
     print("[bootstrap] wrote .vscode/tasks.json and .vscode/settings.json")
 
 
+_PRE_COMMIT_HOOK = """#!/bin/sh
+# VisionGuard pre-commit hook — blocks a commit that introduces new high-severity bugs.
+# Remove with: visionguard hook --remove
+echo "[visionguard] scanning staged files..."
+visionguard scan --staged --new-only --fail-on high
+status=$?
+if [ $status -ne 0 ]; then
+  echo "[visionguard] commit blocked — new high-severity issue(s). Use 'git commit --no-verify' to override."
+fi
+exit $status
+"""
+
+_HOOK_MARKER = "VisionGuard pre-commit hook"
+
+
+def install_git_hook(root: pathlib.Path, remove: bool = False) -> int:
+    hooks_dir = root / ".git" / "hooks"
+    if not (root / ".git").is_dir():
+        print("[hook] not a git repository — nothing to do.")
+        return 1
+    ensure_dir(hooks_dir)
+    hook_path = hooks_dir / "pre-commit"
+
+    if remove:
+        if hook_path.exists() and _HOOK_MARKER in hook_path.read_text(encoding="utf-8", errors="replace"):
+            hook_path.unlink()
+            print("[hook] removed VisionGuard pre-commit hook.")
+        else:
+            print("[hook] no VisionGuard pre-commit hook found.")
+        return 0
+
+    if hook_path.exists():
+        existing = hook_path.read_text(encoding="utf-8", errors="replace")
+        if _HOOK_MARKER not in existing:
+            print(f"[hook] {hook_path} already exists and is not ours — left untouched.")
+            return 1
+    hook_path.write_text(_PRE_COMMIT_HOOK, encoding="utf-8")
+    try:
+        os.chmod(hook_path, 0o755)
+    except OSError:
+        pass
+    print(f"[hook] installed pre-commit hook at {hook_path}")
+    print("[hook] commits now run: visionguard scan --staged --new-only --fail-on high")
+    return 0
+
+
 def install_optional_dependencies() -> None:
     packages = [
         "watchfiles",
@@ -3709,6 +3755,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     sub.add_parser("watch", help="Watch for file changes and auto-scan on every save")
 
+    hook = sub.add_parser("hook", help="Install a git pre-commit hook that blocks new high-severity bugs")
+    hook.add_argument("--remove", action="store_true", help="Remove the VisionGuard pre-commit hook")
+
     rep = sub.add_parser("report", help="List recent reports")
     rep.add_argument("--latest", type=int, default=5, help="Number of reports to show (default: 5)")
 
@@ -3751,6 +3800,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "clean":
         return clean_project(root, config_path, yes=bool(args.yes))
+
+    if args.command == "hook":
+        return install_git_hook(root, remove=bool(args.remove))
 
     if not config_path.exists():
         print("[bootstrap] missing config, creating default setup automatically.")
