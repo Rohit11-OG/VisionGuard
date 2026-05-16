@@ -50,6 +50,34 @@ visionguard report --latest 5
 
 Reports are written to `.agent/reports/report_1.md`, `report_2.md`, ... — each scan makes a new numbered report.
 
+### Scoped scans
+
+Limit a scan to the files you actually touched — faster, less noise:
+
+```bash
+# Only .py files changed vs a git ref
+visionguard scan --since main
+visionguard scan --since HEAD~1
+
+# Only git-staged files — ideal for a pre-commit hook
+visionguard scan --staged
+```
+
+### Baseline — show only new bugs
+
+Record the current findings as accepted, then future scans surface only what's new:
+
+```bash
+# Accept all current issues into .agent/baseline.json
+visionguard scan --update-baseline
+
+# Report only issues absent from the baseline
+visionguard scan --new-only
+```
+
+Every report header shows **new** vs **known** bug counts. Issue identity is
+line-number-independent, so a known bug stays matched as surrounding code shifts.
+
 ---
 
 ## Remove / Uninstall
