@@ -1281,11 +1281,16 @@ class BugDetector:
         "site-packages", "dist-packages", "lib/python", "lib\\python",
         "venv", ".venv", "<frozen", "<string>",
     )
+    # Python stdlib install layout, e.g. .../Python311/Lib/encodings/cp1252.py
+    _STDLIB_PATH_RE = re.compile(r"python[\d.]*[\\/]lib[\\/]", re.I)
 
     def _is_user_frame(self, file_path: str) -> bool:
+        low = file_path.lower()
         for token in self._SKIP_PATH_TOKENS:
-            if token in file_path:
+            if token in low:
                 return False
+        if self._STDLIB_PATH_RE.search(file_path):
+            return False
         return True
 
     def _parse_tracebacks(self, check_name: str, output: str) -> list[Issue]:
