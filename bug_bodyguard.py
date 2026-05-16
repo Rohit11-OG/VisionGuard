@@ -331,10 +331,43 @@ class BaselineStore:
         return len(fps)
 
 
+class SourceCache:
+    """Reads each source file at most once per scan, keyed on path + mtime.
+
+    The indexer and the CV analyzer both walk every .py file; sharing this
+    cache halves the read I/O for an unchanged tree.
+    """
+
+    def __init__(self) -> None:
+        self._cache: dict[str, tuple[int, str]] = {}
+
+    def read(self, path: pathlib.Path) -> str:
+        key = str(path)
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            return ""
+        hit = self._cache.get(key)
+        if hit is not None and hit[0] == mtime:
+            return hit[1]
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        self._cache[key] = (mtime, text)
+        return text
+
+
 class RepoIndexer:
-    def __init__(self, root: pathlib.Path, cfg: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        root: pathlib.Path,
+        cfg: dict[str, Any],
+        sources: SourceCache | None = None,
+    ) -> None:
         self.root = root
         self.cfg = cfg
+        self.sources = sources or SourceCache()
         self.agent_root = root / ".agent"
         self.index_path = self.agent_root / "index" / "index.json"
         self.memory_path = self.agent_root / "memory" / "memory.json"
@@ -347,7 +380,7 @@ class RepoIndexer:
 
         for file_path in py_files:
             rel = file_path.relative_to(self.root).as_posix()
-            text = file_path.read_text(encoding="utf-8", errors="replace")
+            text = self.sources.read(file_path)
             digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
             lines = text.splitlines()
             defs = [line.strip() for line in lines if line.strip().startswith("def ")]
@@ -2441,9 +2474,15 @@ class CVStaticAnalyzer:
         "cv2.", "torch.", "np.", "pyrealsense2", "ultralytics",
     })
 
-    def __init__(self, root: pathlib.Path, cfg: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        root: pathlib.Path,
+        cfg: dict[str, Any],
+        sources: SourceCache | None = None,
+    ) -> None:
         self.root = root
         self.cfg = cfg
+        self.sources = sources or SourceCache()
         self._cache_path = root / ".agent" / "index" / "cv_cache.json"
 
     def _has_cv_hints(self, source: str) -> bool:
@@ -2466,11 +2505,8 @@ class CVStaticAnalyzer:
 
     def _analyze_file(self, file_path: pathlib.Path) -> list[Issue]:
         """Parse and walk one file; return its issues. Safe to call from threads."""
-        try:
-            source = file_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            return []
-        if not self._has_cv_hints(source):
+        source = self.sources.read(file_path)
+        if not source or not self._has_cv_hints(source):
             return []
         try:
             tree = ast.parse(source, filename=str(file_path))
@@ -2495,7 +2531,7 @@ class CVStaticAnalyzer:
         for file_path in py_files:
             try:
                 rel = file_path.relative_to(self.root).as_posix()
-                digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+                digest = hashlib.sha256(self.sources.read(file_path).encode("utf-8")).hexdigest()
             except Exception:
                 to_analyze.append(file_path)
                 continue
@@ -2525,7 +2561,7 @@ class CVStaticAnalyzer:
                     all_issues.extend(issues)
                     try:
                         rel = file_path.relative_to(self.root).as_posix()
-                        digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+                        digest = hashlib.sha256(self.sources.read(file_path).encode("utf-8")).hexdigest()
                         new_cache[rel] = {
                             "sha256": digest,
                             "issues": [dataclasses.asdict(i) for i in issues],
@@ -2538,7 +2574,7 @@ class CVStaticAnalyzer:
                 all_issues.extend(issues)
                 try:
                     rel = file_path.relative_to(self.root).as_posix()
-                    digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+                    digest = hashlib.sha256(self.sources.read(file_path).encode("utf-8")).hexdigest()
                     new_cache[rel] = {
                         "sha256": digest,
                         "issues": [dataclasses.asdict(i) for i in issues],
@@ -3177,10 +3213,11 @@ class BodyguardAgent:
         self.root = root
         self.config_path = config_path
         self.cfg = load_config(config_path)
-        self.indexer = RepoIndexer(root, self.cfg)
+        self.sources = SourceCache()
+        self.indexer = RepoIndexer(root, self.cfg, self.sources)
         self.checks = CheckRunner(root, self.cfg)
         self.detector = BugDetector()
-        self.cv_analyzer = CVStaticAnalyzer(root, self.cfg)
+        self.cv_analyzer = CVStaticAnalyzer(root, self.cfg, self.sources)
         self.fix_planner = FixPlanner(root, self.cfg)
         self.validator = ValidationGate(root)
         self.reporter = ReportWriter(root, self.cfg)
